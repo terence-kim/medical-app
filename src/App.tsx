@@ -6,6 +6,7 @@ import './App.css'
 function App() {
   const [selectedFiles, setSelectedFiles] = useState<File[] | null>(null);
   const [labelMapData, setLabelMapData] = useState<Uint8Array | null>(null);
+  const [boneThreshold, setBoneThreshold] = useState(300); // Lifted state
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -32,6 +33,14 @@ function App() {
         alert("No suitable files found in the selected folder.");
       }
     }
+  };
+
+  const handleHuSelected = (hu: number) => {
+    console.log('HU Selected:', hu);
+    // Update threshold if it's a reasonable bone value (or just update it generally)
+    // We'll clamp it to the slider range for safety
+    const clamped = Math.max(100, Math.min(3000, hu));
+    setBoneThreshold(clamped);
   };
 
   const handleUploadClick = () => {
@@ -115,7 +124,11 @@ function App() {
               </div>
             </div>
             <div className="flex-1 bg-black relative flex items-center justify-center overflow-hidden group">
-              <CornerstoneViewer files={selectedFiles} />
+              <CornerstoneViewer
+                files={selectedFiles}
+                onLabelMapChange={setLabelMapData}
+                onHuSelected={handleHuSelected}
+              />
             </div>
           </div>
 
@@ -130,7 +143,12 @@ function App() {
               </div>
             </div>
             <div className="flex-1 bg-black relative">
-              <VTKViewer files={selectedFiles} />
+              <VTKViewer
+                files={selectedFiles}
+                labelMapData={labelMapData}
+                boneThreshold={boneThreshold}
+                onThresholdChange={setBoneThreshold}
+              />
             </div>
             {/* 3D Orientation Cube Placeholder */}
             <div className="absolute bottom-4 right-4 w-12 h-12 border border-slate-700 rounded flex items-center justify-center opacity-50 pointer-events-none">

@@ -11,6 +11,7 @@ declare module 'cornerstone-tools';
 interface CornerstoneViewerProps {
     files?: File[] | null;
     onLabelMapChange?: (labelMapData: Uint8Array) => void;
+    onHuSelected?: (hu: number) => void;
 }
 
 const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props) => {
@@ -27,7 +28,7 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props) => {
     const [isEraser, setIsEraser] = useState(false);
 
     // Callback prop for labelmap update
-    const { onLabelMapChange } = props;
+    const { onLabelMapChange, onHuSelected } = props;
 
     // Effect for Cornerstone initialization (runs once)
     useEffect(() => {
@@ -60,7 +61,10 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props) => {
             // Register Tools Globally (Once)
             const WwwcTool = cornerstoneTools.WwwcTool;
             const StackScrollMouseWheelTool = cornerstoneTools.StackScrollMouseWheelTool;
-            const BrushTool = cornerstoneTools.BrushTool; // Standard Brush
+            const BrushTool = cornerstoneTools.BrushTool;
+            const LengthTool = cornerstoneTools.LengthTool;
+            const AngleTool = cornerstoneTools.AngleTool;
+            const EraserTool = cornerstoneTools.EraserTool;
 
             // Helper to add tools safely
             const addToolSafe = (ToolClass: any, name?: string) => {
@@ -68,14 +72,17 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props) => {
                     cornerstoneTools.addTool(ToolClass);
                     if (name) console.log(`Tool ${name} added.`);
                 } catch (e) {
-                    // Ignore if already added - this is expected in React HMR or re-mounts
+                    // Ignore if already added
                 }
             };
 
             addToolSafe(WwwcTool, 'Wwwc');
             addToolSafe(StackScrollMouseWheelTool, 'StackScrollMouseWheel');
-            addToolSafe(BrushTool, 'Brush'); // Add standard brush as fallback/base
+            addToolSafe(BrushTool, 'Brush');
             addToolSafe(ThresholdBrushTool, 'ThresholdBrush');
+            addToolSafe(LengthTool, 'Length');
+            addToolSafe(AngleTool, 'Angle');
+            addToolSafe(EraserTool, 'Eraser');
 
             // Set default tool
             cornerstoneTools.setToolActive('Wwwc', { mouseButtonMask: 1 });
@@ -96,17 +103,56 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props) => {
         };
     }, []);
 
+    // Handle Click for HU Picking
+    useEffect(() => {
+        const element = elementRef.current;
+        if (!element || !isReady) return;
+
+        const onMouseDown = (e: Event) => {
+            const mouseEvent = e as MouseEvent;
+            // Only handle left click and when Wwwc tool is active (to avoid conflict with drawing)
+            if (mouseEvent.button === 0 && activeTool === 'Wwwc') {
+                try {
+                    const image = cornerstone.getImage(element);
+                    if (!image) return;
+
+                    const coords = cornerstone.pageToPixel(element, mouseEvent.pageX, mouseEvent.pageY);
+
+                    // Get pixel value
+                    const storedPixels = cornerstone.getStoredPixels(element, coords.x, coords.y, 1, 1);
+                    if (storedPixels && storedPixels.length > 0) {
+                        const sp = storedPixels[0];
+                        const mo = image.slope * sp + image.intercept;
+                        console.log('Clicked HU:', mo);
+                        if (onHuSelected) {
+                            onHuSelected(mo);
+                        }
+                    }
+                } catch (err) {
+                    console.warn('Error picking HU:', err);
+                }
+            }
+        };
+
+        element.addEventListener('mousedown', onMouseDown);
+
+        return () => {
+            element.removeEventListener('mousedown', onMouseDown);
+        };
+    }, [isReady, activeTool, onHuSelected]);
+
     // Load images when files change
     useEffect(() => {
         const element = elementRef.current;
-        if (!element || !props.files || props.files.length === 0 || !isReady) return;
+        const files = props.files; // Local variable for type safety
+        if (!element || !files || files.length === 0 || !isReady) return;
 
         const loadAndSortImages = async () => {
             setLoading(true);
-            console.log('Starting loadAndSortImages with', props.files?.length, 'files');
+            console.log('Starting loadAndSortImages with', files.length, 'files');
 
             try {
-                const imagePromises = props.files.map(async (file) => {
+                const imagePromises = files.map(async (file) => {
                     try {
                         const arrayBuffer = await file.arrayBuffer();
                         const byteArray = new Uint8Array(arrayBuffer);
@@ -180,6 +226,18 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props) => {
                 const viewport = cornerstone.getDefaultViewportForImage(element, image);
                 cornerstone.setViewport(element, viewport);
 
+                // Re-activate StackScrollMouseWheel to ensure it picks up the new stack
+                cornerstoneTools.setToolActive('StackScrollMouseWheel', {});
+
+                // Listen for stack scroll events to update index
+                const onStackScroll = (e: any) => {
+                    if (e.detail && e.detail.newImageIdIndex !== undefined) {
+                        setCurrentImageIndex(e.detail.newImageIdIndex);
+                    }
+                };
+                element.removeEventListener('cornerstonetoolsstackscroll', onStackScroll);
+                element.addEventListener('cornerstonetoolsstackscroll', onStackScroll);
+
             } catch (error) {
                 console.error('Failed to load and sort images:', error);
             } finally {
@@ -210,7 +268,15 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props) => {
         // Always activate StackScrollMouseWheel
         cornerstoneTools.setToolActive('StackScrollMouseWheel', {});
 
-        if (activeTool === 'Brush') {
+        // Deactivate all tools first (to avoid conflicts)
+        cornerstoneTools.setToolPassive('Wwwc');
+        cornerstoneTools.setToolPassive('Brush');
+        cornerstoneTools.setToolPassive('ThresholdBrush');
+        cornerstoneTools.setToolPassive('Length');
+        cornerstoneTools.setToolPassive('Angle');
+        cornerstoneTools.setToolPassive('Eraser');
+
+        if (activeTool === 'Brush' || activeTool === 'Eraser') {
             // Check if stack state exists before proceeding
             const stackState = cornerstoneTools.getToolState(element, 'stack');
             if (!stackState || !stackState.data || stackState.data.length === 0) {
@@ -226,18 +292,16 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props) => {
                 };
             }
 
-            // Activate ThresholdBrush
-            // We use the name 'ThresholdBrush' which is defined in the tool's defaultProps
-            try {
-                cornerstoneTools.setToolActive('ThresholdBrush', { mouseButtonMask: 1 });
-                console.log('ThresholdBrush set to Active');
-            } catch (e) {
-                console.error('Failed to activate ThresholdBrush:', e);
-                // Fallback to standard brush if custom one fails
-                cornerstoneTools.setToolActive('Brush', { mouseButtonMask: 1 });
+            // Activate ThresholdBrush or Eraser
+            if (activeTool === 'Eraser') {
+                cornerstoneTools.setToolActive('Eraser', { mouseButtonMask: 1 });
+            } else { // activeTool === 'Brush'
+                try {
+                    cornerstoneTools.setToolActive('ThresholdBrush', { mouseButtonMask: 1 });
+                } catch (e) {
+                    cornerstoneTools.setToolActive('Brush', { mouseButtonMask: 1 });
+                }
             }
-
-            cornerstoneTools.setToolPassive('Wwwc');
 
             // Set Brush Size
             const brushModule = cornerstoneTools.store.modules.brush;
@@ -248,7 +312,7 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props) => {
             // Set Segment Index (1 for Draw, 0 for Eraser)
             if (segmentationModule && segmentationModule.setters) {
                 try {
-                    // Force Label 1 color to Green (Safety check already in init, but good to ensure)
+                    // Force Label 1 color to Green
                     if (typeof segmentationModule.setters.colorForSegment === 'function') {
                         segmentationModule.setters.colorForSegment(1, [0, 255, 0, 255]);
                     }
@@ -260,9 +324,8 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props) => {
                         segmentationModule.setters.activeLabelmapIndex(element, 0);
                     }
 
-                    if (isEraser) {
-                        segmentationModule.setters.activeSegmentIndex(element, 0); // Eraser
-                    } else {
+                    // For Eraser tool, it handles erasing itself, but for Brush we need to set index
+                    if (activeTool === 'Brush') {
                         segmentationModule.setters.activeSegmentIndex(element, 1); // Draw
                     }
 
@@ -270,11 +333,12 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props) => {
                     console.warn('Failed to set active segment index:', error);
                 }
             }
-        } else {
+        } else if (activeTool === 'Length') {
+            cornerstoneTools.setToolActive('Length', { mouseButtonMask: 1 });
+        } else if (activeTool === 'Angle') {
+            cornerstoneTools.setToolActive('Angle', { mouseButtonMask: 1 });
+        } else { // Default to Wwwc
             cornerstoneTools.setToolActive('Wwwc', { mouseButtonMask: 1 });
-            cornerstoneTools.setToolPassive('ThresholdBrush');
-            cornerstoneTools.setToolPassive('Brush');
-            console.log('Wwwc set to Active');
         }
 
         // Force refresh to apply changes
@@ -284,7 +348,35 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props) => {
             console.warn('Failed to update image:', e);
         }
 
-    }, [activeTool, isReady, brushSize, isEraser, sortedFiles]);
+    }, [activeTool, isReady, brushSize, sortedFiles]);
+
+    const applyPreset = (presetName: string) => {
+        const element = elementRef.current;
+        if (!element) return;
+
+        const viewport = cornerstone.getViewport(element);
+        if (!viewport) return;
+
+        switch (presetName) {
+            case 'Brain':
+                viewport.voi.windowWidth = 80;
+                viewport.voi.windowCenter = 40;
+                break;
+            case 'Lung':
+                viewport.voi.windowWidth = 1500;
+                viewport.voi.windowCenter = -600;
+                break;
+            case 'Bone':
+                viewport.voi.windowWidth = 2000;
+                viewport.voi.windowCenter = 400;
+                break;
+            case 'Soft Tissue':
+                viewport.voi.windowWidth = 400;
+                viewport.voi.windowCenter = 40;
+                break;
+        }
+        cornerstone.setViewport(element, viewport);
+    };
 
     const extractLabelMap = async () => {
         if (sortedFiles.length === 0) return;
@@ -341,78 +433,99 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props) => {
     return (
         <div className="w-full h-full flex flex-col bg-black relative">
             {/* Toolbar */}
-            <div className="h-12 bg-slate-900 border-b border-slate-700 flex items-center px-4 gap-4 z-20 justify-between">
-                <div className="flex items-center">
-                    <div className="text-primary-400 font-bold mr-4">2D View</div>
-
+            <div className="h-14 bg-slate-900 border-b border-slate-700 flex items-center px-4 gap-4 z-20 justify-between overflow-x-auto">
+                <div className="flex items-center gap-2">
+                    {/* Tools Group */}
                     <div className="flex bg-slate-800 rounded-lg p-1 gap-1">
                         <button
                             onClick={() => setActiveTool('Wwwc')}
-                            className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${activeTool === 'Wwwc'
-                                ? 'bg-primary-600 text-white'
-                                : 'text-slate-300 hover:bg-slate-700'
-                                }`}
+                            className={`p-1.5 rounded transition-colors ${activeTool === 'Wwwc' ? 'bg-primary-600 text-white' : 'text-slate-400 hover:bg-slate-700'}`}
+                            title="Window/Level"
                         >
-                            Window/Level
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+                            </svg>
                         </button>
                         <button
-                            onClick={() => {
-                                setActiveTool('Brush');
-                                setIsEraser(false);
-                            }}
-                            className={`px-3 py-1.5 rounded text-sm font-medium transition-colors flex items-center gap-2 ${activeTool === 'Brush' && !isEraser
-                                ? 'bg-primary-600 text-white'
-                                : 'text-slate-300 hover:bg-slate-700'
-                                }`}
+                            onClick={() => setActiveTool('Length')}
+                            className={`p-1.5 rounded transition-colors ${activeTool === 'Length' ? 'bg-primary-600 text-white' : 'text-slate-400 hover:bg-slate-700'}`}
+                            title="Length Measurement"
                         >
-                            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                                <path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.379-2.83-2.828z" />
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
                             </svg>
-                            Brush
                         </button>
                         <button
-                            onClick={() => {
-                                setActiveTool('Brush');
-                                setIsEraser(true);
-                            }}
-                            className={`px-3 py-1.5 rounded text-sm font-medium transition-colors flex items-center gap-2 ${activeTool === 'Brush' && isEraser
-                                ? 'bg-red-600 text-white'
-                                : 'text-slate-300 hover:bg-slate-700'
-                                }`}
+                            onClick={() => setActiveTool('Angle')}
+                            className={`p-1.5 rounded transition-colors ${activeTool === 'Angle' ? 'bg-primary-600 text-white' : 'text-slate-400 hover:bg-slate-700'}`}
+                            title="Angle Measurement"
                         >
-                            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                                <path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" />
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 17l-5-5m0 0l5-5m-5 5h8" />
                             </svg>
-                            Eraser
                         </button>
                     </div>
 
-                    {activeTool === 'Brush' && (
-                        <div className="flex items-center gap-3 bg-slate-800 rounded-lg px-3 py-1.5 ml-2 border border-slate-700">
-                            <span className="text-xs text-slate-400 font-mono">Size: {brushSize}px</span>
+                    <div className="w-px h-8 bg-slate-700 mx-1"></div>
+
+                    {/* Segmentation Group */}
+                    <div className="flex bg-slate-800 rounded-lg p-1 gap-1">
+                        <button
+                            onClick={() => setActiveTool('Brush')}
+                            className={`p-1.5 rounded transition-colors ${activeTool === 'Brush' ? 'bg-primary-600 text-white' : 'text-slate-400 hover:bg-slate-700'}`}
+                            title="Brush"
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                            </svg>
+                        </button>
+                        <button
+                            onClick={() => setActiveTool('Eraser')}
+                            className={`p-1.5 rounded transition-colors ${activeTool === 'Eraser' ? 'bg-red-600 text-white' : 'text-slate-400 hover:bg-slate-700'}`}
+                            title="Eraser"
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                            </svg>
+                        </button>
+                    </div>
+
+                    {/* Brush Size */}
+                    {(activeTool === 'Brush' || activeTool === 'Eraser') && (
+                        <div className="flex items-center gap-2 bg-slate-800 rounded-lg px-2 py-1 border border-slate-700">
+                            <span className="text-[10px] text-slate-400 font-mono">Size</span>
                             <input
                                 type="range"
                                 min="1"
                                 max="50"
                                 value={brushSize}
                                 onChange={(e) => setBrushSize(parseInt(e.target.value))}
-                                className="w-24 h-1 bg-slate-600 rounded-lg appearance-none cursor-pointer accent-primary-500"
+                                className="w-16 h-1 bg-slate-600 rounded-lg appearance-none cursor-pointer accent-primary-500"
                             />
                         </div>
                     )}
                 </div>
 
-                {/* Manual Sync Button */}
-                <button
-                    onClick={extractLabelMap}
-                    className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-sm font-medium transition-colors flex items-center gap-2 shadow-sm"
-                    title="Update 3D Mask from 2D Segmentation"
-                >
-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
-                        <path fillRule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clipRule="evenodd" />
-                    </svg>
-                    Update 3D Mask
-                </button>
+                <div className="flex items-center gap-2">
+                    {/* Presets */}
+                    <div className="flex gap-1">
+                        <button onClick={() => applyPreset('Brain')} className="text-[10px] bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-1 rounded">Brain</button>
+                        <button onClick={() => applyPreset('Lung')} className="text-[10px] bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-1 rounded">Lung</button>
+                        <button onClick={() => applyPreset('Bone')} className="text-[10px] bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-1 rounded">Bone</button>
+                    </div>
+
+                    {/* Manual Sync Button */}
+                    <button
+                        onClick={extractLabelMap}
+                        className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-sm font-medium transition-colors flex items-center gap-2 shadow-sm"
+                        title="Update 3D Mask from 2D Segmentation"
+                    >
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                            <path fillRule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clipRule="evenodd" />
+                        </svg>
+                        Update 3D
+                    </button>
+                </div>
             </div>
 
             <div
@@ -432,7 +545,6 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props) => {
                 <div className="absolute top-16 left-4 text-xs text-primary-500 font-mono pointer-events-none z-10 bg-black/50 p-2 rounded">
                     <div>{`Slice: ${currentImageIndex !== null ? currentImageIndex + 1 : 0} / ${totalImages}`}</div>
                     <div>{`Active Tool: ${activeTool}`}</div>
-                    <div>{`Stack State: ${currentImageIndex !== null ? 'Present' : 'Missing'}`}</div>
                 </div>
             )}
         </div>
