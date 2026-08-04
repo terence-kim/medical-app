@@ -1,180 +1,243 @@
-import { useState, useRef } from 'react'
+import { useRef, useState, useCallback } from 'react'
 import VTKViewer from './components/VTKViewer'
-import CornerstoneViewer from './components/CornerstoneViewer'
+import CornerstoneViewer, { type DicomMetadata } from './components/CornerstoneViewer'
+import MPRViewer from './components/MPRViewer'
+import MaskPanel from './components/MaskPanel'
+import { DEFAULT_MASKS, type Mask } from './types/mask'
 import './App.css'
 
 function App() {
-  const [selectedFiles, setSelectedFiles] = useState<File[] | null>(null);
-  const [labelMapData, setLabelMapData] = useState<Uint8Array | null>(null);
-  const [boneThreshold, setBoneThreshold] = useState(300); // Lifted state
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  // ── File state ────────────────────────────────────────────────────────────
+  const [selectedFiles,  setSelectedFiles]  = useState<File[] | null>(null);
+  const [labelMapData,   setLabelMapData]   = useState<Uint8Array | null>(null);
+  const [caseMeta,       setCaseMeta]       = useState<DicomMetadata | null>(null);
+  const [toast,          setToast]          = useState<string | null>(null);
+  const [viewMode,       setViewMode]       = useState<'2d' | 'mpr'>('2d');
+  const fileInputRef     = useRef<HTMLInputElement>(null);
+  const toastTimerRef    = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // ── Mask state (shared between MaskPanel, CornerstoneViewer, VTKViewer) ──
+  const [masks,          setMasks]          = useState<Mask[]>(DEFAULT_MASKS);
+  const [activeMaskId,   setActiveMaskId]   = useState<string>('bone');
+  const [brushMode,      setBrushMode]      = useState<'draw' | 'erase'>('draw');
+  // Incremented every time Draw or Erase is clicked in MaskPanel, so
+  // CornerstoneViewer's useEffect always fires (even if mode doesn't change).
+  const [brushModeTick,  setBrushModeTick]  = useState(0);
+  const [brushHuMin,     setBrushHuMin]     = useState(400);
+  const [brushHuMax,     setBrushHuMax]     = useState(3000);
+  const [fillProgress,   setFillProgress]   = useState<number | null>(null);
+  const [isGenerating,   setIsGenerating]   = useState(false);
+
+  // ── VTK / 3D ──────────────────────────────────────────────────────────────
+  // Callback refs so VTKViewer can expose imperative actions
+  const vtkGenerateRef     = useRef<(() => void) | null>(null);
+  const csViewerRef        = useRef<{
+    fillCurrentSlice: () => void;
+    fillAllSlices:    () => void;
+  } | null>(null);
+
+  // Sync active mask HU range to brush when mask changes
+  const handleActiveMaskChange = useCallback((id: string) => {
+    setActiveMaskId(id);
+    const m = masks.find(x => x.id === id);
+    if (m) { setBrushHuMin(m.huMin); setBrushHuMax(m.huMax); }
+  }, [masks]);
+
+  const handleMasksChange = useCallback((updated: Mask[]) => {
+    setMasks(updated);
+    const active = updated.find(m => m.id === activeMaskId);
+    if (active) { setBrushHuMin(active.huMin); setBrushHuMax(active.huMax); }
+  }, [activeMaskId]);
+
+  const handleBrushHuChange = useCallback((min: number, max: number) => {
+    setBrushHuMin(min);
+    setBrushHuMax(max);
+  }, []);
+
+  // ── Toast ─────────────────────────────────────────────────────────────────
+  const showToast = (message: string) => {
+    setToast(message);
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = setTimeout(() => setToast(null), 3500);
+  };
+
+  // ── File handling ─────────────────────────────────────────────────────────
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
     if (files && files.length > 0) {
-      console.log(`Selected ${files.length} files`);
-      const fileArray = Array.from(files);
-
-      // Log file names for debugging
-      fileArray.forEach(f => console.log('File:', f.name, f.type, f.size));
-
-      // Relaxed filter: Allow .dcm, .ima, or files with no extension (common for DICOM)
-      // Also exclude known non-image types to avoid clutter
-      const candidateFiles = fileArray.filter(f => {
-        const name = f.name.toLowerCase();
-        return !name.endsWith('.json') && !name.endsWith('.txt') && !name.endsWith('.xml') && !name.endsWith('.ds_store');
+      const candidateFiles = Array.from(files).filter(f => {
+        const n = f.name.toLowerCase();
+        return !n.endsWith('.json') && !n.endsWith('.txt') && !n.endsWith('.xml') && !n.endsWith('.ds_store');
       });
-
       if (candidateFiles.length > 0) {
-        console.log(`Passing ${candidateFiles.length} candidate files to viewer`);
         setSelectedFiles(candidateFiles);
-        setLabelMapData(null); // Reset labelmap on new file load
+        setLabelMapData(null);
+        setCaseMeta(null);
       } else {
-        alert("No suitable files found in the selected folder.");
+        showToast('선택한 폴더/파일에서 사용 가능한 DICOM 파일을 찾지 못했습니다.');
       }
     }
   };
 
-  const handleHuSelected = (hu: number) => {
-    console.log('HU Selected:', hu);
-    // Update threshold if it's a reasonable bone value (or just update it generally)
-    // We'll clamp it to the slider range for safety
-    const clamped = Math.max(100, Math.min(3000, hu));
-    setBoneThreshold(clamped);
-  };
+  // ── Header info ───────────────────────────────────────────────────────────
+  const patientInfo = caseMeta
+    ? `${caseMeta.patientName ?? 'Unknown'} · ${caseMeta.modality ?? '—'}${caseMeta.studyDescription ? ' · ' + caseMeta.studyDescription : ''}`
+    : selectedFiles ? 'Loading study…' : null;
 
-  const handleUploadClick = () => {
-    fileInputRef.current?.click();
-  };
+  const isCT = caseMeta?.modality === 'CT';
 
   return (
-    <div className="flex h-screen w-full bg-dark-bg text-slate-200 font-sans overflow-hidden">
-      {/* Sidebar */}
-      <aside className="w-64 border-r border-slate-800 bg-dark-surface flex flex-col">
-        <div className="h-16 flex items-center px-6 border-b border-slate-800">
-          <span className="text-xl font-bold text-primary-500">MediCare</span>
+    <div className="flex flex-col h-screen w-full bg-[#141414] text-slate-200 font-sans overflow-hidden">
+
+      {/* ── Header toolbar ────────────────────────────────────────────────── */}
+      <header className="h-10 bg-[#1a1a1a] border-b border-[#333] flex items-center px-3 gap-2 shrink-0">
+
+        {/* Logo */}
+        <span className="text-sm font-bold text-sky-400 tracking-tight mr-2">MediCare</span>
+        <div className="w-px h-5 bg-[#333]" />
+
+        {/* File open buttons */}
+        <button onClick={() => fileInputRef.current?.click()}
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded text-xs bg-[#2a2a2a] hover:bg-[#333] text-slate-300 border border-[#3a3a3a] transition-colors">
+          <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>
+          </svg>
+          Open Folder
+        </button>
+        <input type="file" ref={fileInputRef} onChange={handleFileChange}
+          // @ts-expect-error webkitdirectory not in React types
+          webkitdirectory="" directory="" multiple className="hidden" />
+
+        <button onClick={() => document.getElementById('file-input-single')?.click()}
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded text-xs bg-[#2a2a2a] hover:bg-[#333] text-slate-300 border border-[#3a3a3a] transition-colors">
+          <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/>
+            <polyline points="13 2 13 9 20 9"/>
+          </svg>
+          Open Files
+        </button>
+        <input id="file-input-single" type="file" onChange={handleFileChange} multiple className="hidden" />
+
+        <div className="w-px h-5 bg-[#333]" />
+
+        {/* View mode */}
+        <div className="flex bg-[#111] rounded p-0.5 gap-0.5">
+          {(['2d', 'mpr'] as const).map(v => (
+            <button key={v} onClick={() => setViewMode(v)}
+              className={`px-2.5 py-0.5 rounded text-xs font-semibold transition-colors ${
+                viewMode === v ? 'bg-sky-700 text-white' : 'text-slate-500 hover:text-slate-300'
+              }`}>
+              {v.toUpperCase()}
+            </button>
+          ))}
         </div>
-        <nav className="flex-1 p-4 space-y-2">
-          <NavItem active>Dashboard</NavItem>
-          <NavItem>Patients</NavItem>
-          <NavItem>Appointments</NavItem>
-          <NavItem>Settings</NavItem>
-        </nav>
-        <div className="p-4 border-t border-slate-800">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-full bg-slate-700 flex items-center justify-center text-xs font-bold">DK</div>
-            <div className="text-sm">
-              <div className="font-medium">Dr. Kim</div>
-              <div className="text-slate-500 text-xs">Cardiology</div>
+
+        {/* Patient info */}
+        {patientInfo && (
+          <>
+            <div className="w-px h-5 bg-[#333]" />
+            <span className="text-xs text-slate-400 truncate max-w-xs">{patientInfo}</span>
+          </>
+        )}
+
+        <div className="flex-1" />
+
+        {/* File count badge */}
+        {selectedFiles && (
+          <span className="text-[10px] bg-[#2a2a2a] border border-[#3a3a3a] text-slate-400 px-2 py-0.5 rounded font-mono">
+            {selectedFiles.length} files
+          </span>
+        )}
+      </header>
+
+      {/* ── Main content ──────────────────────────────────────────────────── */}
+      <div className="flex flex-1 min-h-0">
+
+        {/* Left: 2D / MPR viewer */}
+        <div className="flex flex-col border-r border-[#2a2a2a] min-w-0" style={{ width: '45%' }}>
+
+          {/* 2D sub-header */}
+          <div className="h-7 bg-[#1a1a1a] border-b border-[#2a2a2a] flex items-center px-3 gap-2 shrink-0">
+            <span className="text-[10px] text-slate-500 font-medium uppercase tracking-wider">2D View</span>
+            {caseMeta?.modality && (
+              <span className="text-[10px] bg-[#2a2a2a] text-slate-400 px-1.5 py-0.5 rounded font-mono">
+                {caseMeta.modality}
+              </span>
+            )}
+          </div>
+
+          {/* Cornerstone 2D viewer */}
+          <div className={`flex-1 bg-black relative overflow-hidden ${viewMode === 'mpr' ? 'hidden' : ''}`}>
+            <CornerstoneViewer
+              files={selectedFiles}
+              masks={masks}
+              activeMaskId={activeMaskId}
+              brushMode={brushMode}
+              brushModeTick={brushModeTick}
+              brushHuMin={brushHuMin}
+              brushHuMax={brushHuMax}
+              onLabelMapChange={setLabelMapData}
+              onMetadataChange={setCaseMeta}
+              onFillProgressChange={setFillProgress}
+              imperativeRef={csViewerRef}
+            />
+          </div>
+
+          {/* MPR viewer */}
+          {viewMode === 'mpr' && (
+            <div className="flex-1 bg-black relative overflow-hidden">
+              <MPRViewer files={selectedFiles} />
             </div>
+          )}
+        </div>
+
+        {/* Center: 3D view */}
+        <div className="flex flex-col min-w-0 flex-1">
+          <div className="h-7 bg-[#1a1a1a] border-b border-[#2a2a2a] flex items-center px-3 gap-2 shrink-0">
+            <span className="text-[10px] text-slate-500 font-medium uppercase tracking-wider">3D View</span>
+          </div>
+          <div className="flex-1 bg-black relative overflow-hidden">
+            <VTKViewer
+              files={selectedFiles}
+              masks={masks}
+              labelMapData={labelMapData}
+              modality={caseMeta?.modality}
+              onError={showToast}
+              onGeneratingChange={setIsGenerating}
+              generateRef={vtkGenerateRef}
+            />
           </div>
         </div>
-      </aside>
 
-      {/* Main Content */}
-      <main className="flex-1 flex flex-col min-w-0 bg-black">
-        {/* Header */}
-        <header className="h-14 border-b border-slate-800 bg-dark-bg flex items-center justify-between px-4 shrink-0">
-          <h1 className="text-sm font-semibold text-slate-300">Case ID: 2024-001 (Brain MRI)</h1>
-          <div className="flex items-center gap-3">
-            <div className="text-xs text-slate-500">Last saved: Just now</div>
-          </div>
-        </header>
+        {/* Right: Mask Control panel */}
+        <MaskPanel
+          masks={masks}
+          activeMaskId={activeMaskId}
+          brushMode={brushMode}
+          brushHuMin={brushHuMin}
+          brushHuMax={brushHuMax}
+          isCT={isCT}
+          fillProgress={fillProgress}
+          isGenerating={isGenerating}
+          onMasksChange={handleMasksChange}
+          onActiveMaskChange={handleActiveMaskChange}
+          onBrushModeChange={(mode) => { setBrushMode(mode); setBrushModeTick(t => t + 1); }}
+          onBrushHuChange={handleBrushHuChange}
+          onGenerateModel={() => vtkGenerateRef.current?.()}
+          onFillCurrentSlice={() => csViewerRef.current?.fillCurrentSlice()}
+          onFillAllSlices={() => csViewerRef.current?.fillAllSlices()}
+          onSendTo3D={() => csViewerRef.current?.sendTo3D()}
+        />
+      </div>
 
-        {/* Split View Container */}
-        <div className="flex-1 flex flex-row overflow-hidden">
-          {/* Left Panel: 2D View */}
-          <div className="flex-1 flex flex-col border-r border-slate-700 min-w-0">
-            <div className="h-8 bg-slate-900 border-b border-slate-800 flex items-center px-3 justify-between shrink-0">
-              <span className="text-xs font-medium text-slate-400">2D View</span>
-              <div className="flex gap-2 items-center">
-                {/* File Upload Buttons */}
-                <button
-                  onClick={() => fileInputRef.current?.click()}
-                  className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-0.5 rounded transition-colors"
-                  title="Open DICOM Folder"
-                >
-                  Open Folder
-                </button>
-                <input
-                  type="file"
-                  ref={fileInputRef}
-                  onChange={handleFileChange}
-                  // @ts-ignore
-                  webkitdirectory=""
-                  directory=""
-                  multiple
-                  className="hidden"
-                />
-
-                <button
-                  onClick={() => document.getElementById('single-file-input')?.click()}
-                  className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-2 py-0.5 rounded transition-colors"
-                  title="Open DICOM Files"
-                >
-                  Open Files
-                </button>
-                <input
-                  id="single-file-input"
-                  type="file"
-                  onChange={handleFileChange}
-                  multiple
-                  className="hidden"
-                />
-              </div>
-            </div>
-            <div className="flex-1 bg-black relative flex items-center justify-center overflow-hidden group">
-              <CornerstoneViewer
-                files={selectedFiles}
-                onLabelMapChange={setLabelMapData}
-                onHuSelected={handleHuSelected}
-              />
-            </div>
-          </div>
-
-          {/* Right Panel: 3D Volume */}
-          <div className="flex-1 flex flex-col min-w-0">
-            <div className="h-8 bg-slate-900 border-b border-slate-800 flex items-center px-3 justify-between shrink-0">
-              <span className="text-xs font-medium text-slate-400">3D Volume</span>
-              <div className="flex gap-2">
-                {/* Toolbar placeholders */}
-                <div className="w-3 h-3 rounded-full bg-slate-700"></div>
-                <div className="w-3 h-3 rounded-full bg-slate-700"></div>
-              </div>
-            </div>
-            <div className="flex-1 bg-black relative">
-              <VTKViewer
-                files={selectedFiles}
-                labelMapData={labelMapData}
-                boneThreshold={boneThreshold}
-                onThresholdChange={setBoneThreshold}
-              />
-            </div>
-            {/* 3D Orientation Cube Placeholder */}
-            <div className="absolute bottom-4 right-4 w-12 h-12 border border-slate-700 rounded flex items-center justify-center opacity-50 pointer-events-none">
-              <span className="text-[10px] text-slate-500">3D</span>
-            </div>
-          </div>
+      {/* Toast */}
+      {toast && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-[#1e1e1e] border border-[#444] text-slate-100 text-sm px-4 py-2 rounded-lg shadow-2xl max-w-md text-center">
+          {toast}
         </div>
-      </main>
+      )}
     </div>
-  )
+  );
 }
 
-function NavItem({ children, active = false }: { children: React.ReactNode; active?: boolean }) {
-  return (
-    <a
-      href="#"
-      className={`block px-4 py-2 rounded-md text-sm transition-colors font-medium ${active
-        ? 'bg-primary-500/10 text-primary-500'
-        : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
-        }`}
-    >
-      {children}
-    </a>
-  )
-}
-
-
-
-export default App
+export default App;

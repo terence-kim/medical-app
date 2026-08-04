@@ -1,9 +1,3 @@
-declare module 'cornerstone-core';
-declare module 'cornerstone-wado-image-loader';
-declare module 'dicom-parser';
-declare module 'cornerstone-tools';
-declare module 'cornerstone-math';
-
 import cornerstone from 'cornerstone-core';
 import cornerstoneWADOImageLoader from 'cornerstone-wado-image-loader';
 import dicomParser from 'dicom-parser';
@@ -23,7 +17,7 @@ export function initCornerstone() {
 
     // Register HammerJS globally (optional but good practice)
     if (typeof window !== 'undefined') {
-        (window as any).Hammer = Hammer;
+        (window as unknown as { Hammer: typeof Hammer }).Hammer = Hammer;
     }
 
     // Initialize Cornerstone Tools
