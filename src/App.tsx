@@ -34,9 +34,10 @@ function App() {
   // the labelmap directly (zero React-state copy)
   const vtkRefreshLabelMapRef = useRef<((data: Uint8Array) => void) | null>(null);
   const csViewerRef           = useRef<{
-    fillCurrentSlice: () => void;
-    fillAllSlices:    () => void;
-    sendTo3D:         () => void;
+    fillCurrentSlice:          () => void;
+    fillAllSlices:             () => void;
+    sendTo3D:                  () => void;
+    applyOrgansSegmentation:   (organs: { id: string; huMin: number; huMax: number }[]) => Promise<void>;
   } | null>(null);
 
   // Sync active mask HU range to brush when mask changes
@@ -206,6 +207,7 @@ function App() {
               onGeneratingChange={setIsGenerating}
               generateRef={vtkGenerateRef}
               refreshLabelMapRef={vtkRefreshLabelMapRef}
+              onSegmentationGenerated={(organs) => csViewerRef.current?.applyOrgansSegmentation(organs)}
             />
           </div>
         </div>

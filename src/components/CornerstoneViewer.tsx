@@ -91,6 +91,8 @@ export interface CornerstoneViewerHandle {
     fillCurrentSlice: () => void;
     fillAllSlices:    () => void;
     sendTo3D:         () => void;
+    /** Apply multi-organ HU-based segmentation to every 2D slice (called after 3D generation). */
+    applyOrgansSegmentation: (organs: { id: string; huMin: number; huMax: number }[]) => Promise<void>;
 }
 
 interface CornerstoneViewerProps {
@@ -928,6 +930,103 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
         }
     }, [isReady, isCT]);
 
+    // Apply multiple organs' HU segmentation to every slice in a single pass.
+    // Called by VTKViewer (via App.tsx callback) after 3D generation so the 2D
+    // overlay matches what was rendered in 3D.
+    const applyOrgansSegmentation = useCallback(async (
+        organs: { id: string; huMin: number; huMax: number }[],
+    ) => {
+        if (!isReady || !isCT || organs.length === 0) return;
+        const element = elementRef.current;
+        const files   = sortedFilesRef.current;
+        if (!element || files.length === 0) return;
+
+        // Pre-resolve segment indices
+        const orgInfos = organs.map(org => {
+            const extMatch = extMasksRef.current?.find((m: { id: string }) => m.id === org.id);
+            const segIdx   = extMatch?.segmentIndex
+                ?? (TISSUE_TYPES.find(t => t.id === org.id)?.segmentIndex ?? 1);
+            return { ...org, segmentIndex: segIdx };
+        });
+
+        const segMod = cornerstoneTools.getModule('segmentation');
+        try { segMod.setters.activeLabelmapIndex(element, 0); } catch { /* ok */ }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const ee   = cornerstone.getEnabledElement(element) as any;
+        const uuid = ee?.uuid;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const ss   = segMod.state?.series?.[uuid] as any;
+        if (!ss) return;
+        const ai  = ss.activeLabelmapIndex ?? 0;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const lm3D = ss.labelmaps3D?.[ai] as any;
+        if (!lm3D) return;
+
+        setFillProgress(0);
+        for (let i = 0; i < files.length; i++) {
+            try {
+                const ab        = await files[i].arrayBuffer();
+                const ba        = new Uint8Array(ab);
+                const ds        = dicomParser.parseDicom(ba);
+                const rows      = ds.uint16('x00280010') ?? 0;
+                const cols      = ds.uint16('x00280011') ?? 0;
+                const bitsAlloc = ds.uint16('x00280100') ?? 16;
+                const pixRep    = ds.uint16('x00280103') ?? 0;
+                const slope     = parseFloat(ds.string('x00281053') ?? '1') || 1;
+                const intercept = parseFloat(ds.string('x00281052') ?? '0') || 0;
+                const pixElem   = ds.elements['x7fe00010'];
+                if (!pixElem || rows === 0 || cols === 0) continue;
+
+                const count  = rows * cols;
+                let rawPx: Int16Array | Uint16Array | Uint8Array;
+                if (bitsAlloc === 16) {
+                    rawPx = pixRep === 1
+                        ? new Int16Array(ab, pixElem.dataOffset, count)
+                        : new Uint16Array(ab, pixElem.dataOffset, count);
+                } else if (bitsAlloc === 8) {
+                    rawPx = new Uint8Array(ab, pixElem.dataOffset, count);
+                } else continue;
+
+                if (!lm3D.labelmaps2D[i]) {
+                    lm3D.labelmaps2D[i] = {
+                        pixelData: new Uint8Array(count),
+                        segmentsOnLabelmap: [],
+                        isVisible: true,
+                        isInterpolated: false,
+                    };
+                }
+                const pd = lm3D.labelmaps2D[i].pixelData as Uint8Array;
+
+                // Single pass per pixel — first matching organ wins
+                for (let j = 0; j < count; j++) {
+                    const hu = rawPx[j] * slope + intercept;
+                    let hit = false;
+                    for (const org of orgInfos) {
+                        if (hu >= org.huMin && hu <= org.huMax) {
+                            pd[j] = org.segmentIndex;
+                            hit = true;
+                            break;
+                        }
+                    }
+                    // Do NOT clear pixels that don't match — preserve any manual brush work
+                    if (!hit && pd[j] !== 0) {
+                        // Only clear if the pixel was set by one of the organs being re-applied
+                        const wasOrgPixel = orgInfos.some(o => o.segmentIndex === pd[j]);
+                        if (wasOrgPixel) pd[j] = 0;
+                    }
+                }
+            } catch (err) {
+                console.warn(`applyOrgansSegmentation slice ${i}:`, err);
+            }
+            setFillProgress(Math.round((i + 1) / files.length * 100));
+            await new Promise<void>(r => setTimeout(r, 0));
+        }
+
+        setFillProgress(null);
+        try { cornerstone.updateImage(elementRef.current!); } catch { /* ignore */ }
+        renderSegOverlayRef.current?.();
+    }, [isReady, isCT]);
+
     // "전체 스택 채우기" — uses the currently active mask (from external props)
     const fillAllSlices = useCallback(async () => {
         if (!isReady || !isCT || fillProgress !== null) return;
@@ -1156,8 +1255,9 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             fillCurrentSlice,
             fillAllSlices,
             sendTo3D: () => { extractLabelMapRef.current?.(); },
+            applyOrgansSegmentation,
         };
-    }, [fillCurrentSlice, fillAllSlices, imperativeRef]);
+    }, [fillCurrentSlice, fillAllSlices, applyOrgansSegmentation, imperativeRef]);
 
     // Propagate fill progress to parent
     useEffect(() => {

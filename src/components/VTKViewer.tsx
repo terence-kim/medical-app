@@ -31,6 +31,8 @@ interface VTKViewerProps {
     generateRef?: React.MutableRefObject<(() => void) | null>;
     /** Parent populates this ref so CornerstoneViewer can push labelmap directly (no state copy) */
     refreshLabelMapRef?: React.MutableRefObject<((data: Uint8Array) => void) | null>;
+    /** Called after HU-based 3D generation so CornerstoneViewer can color matching 2D slices */
+    onSegmentationGenerated?: (organs: { id: string; huMin: number; huMax: number }[]) => void;
 }
 
 type FullScreenRenderer = ReturnType<typeof vtkFullScreenRenderWindow.newInstance>;
@@ -43,7 +45,7 @@ interface VtkContext {
     maskVolume: VtkVolumeActor | null;
 }
 
-function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef, refreshLabelMapRef }: VTKViewerProps) {
+function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef, refreshLabelMapRef, onSegmentationGenerated }: VTKViewerProps) {
     const vtkContainerRef = useRef<HTMLDivElement>(null);
     const context = useRef<VtkContext | null>(null);
     const [isLoading,      setIsLoading]      = useState(false);
@@ -853,6 +855,13 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
         renderWindow.render();
         setHasMeshes(true);
         onGeneratingChange?.(false);
+
+        // Notify CornerstoneViewer to mirror the segmentation on the 2D slices
+        if (huBasedOrgs.length > 0) {
+            onSegmentationGenerated?.(
+                huBasedOrgs.map(o => ({ id: o.id, huMin: o.huMin, huMax: o.huMax }))
+            );
+        }
     };
 
     // Expose generate to parent via generateRef
