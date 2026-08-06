@@ -36,6 +36,10 @@ export interface VolumeResult {
 const XY_MAX   = 256;
 /** Maximum number of Z slices before Z sub-sampling kicks in. */
 const Z_MAX    = 150;
+/** Hard cap on total voxel count (Int16Array bytes ÷ 2).
+ *  512×512×300 full-res = 78M voxels @ 2B = ~150MB raw.
+ *  Cap at 16M voxels → ≤32MB raw, leaving headroom for VTK textures.   */
+const VOXEL_CAP = 16_000_000;
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -156,20 +160,44 @@ export async function createVolumeFromFiles(
         }
     }
 
-    // XY downsample: halve if either dimension exceeds XY_MAX
-    const xyScale  = (origRows > XY_MAX || origCols > XY_MAX) ? 2 : 1;
-    const outCols  = Math.ceil(origCols / xyScale);
-    const outRows  = Math.ceil(origRows / xyScale);
+    // ── Adaptive downsampling: keep total voxel count under VOXEL_CAP ─────────
+    // Start with XY halving if dimensions are large, then also consider extra Z step.
+    let xyScale = (origRows > XY_MAX || origCols > XY_MAX) ? 2 : 1;
+    let outCols  = Math.ceil(origCols / xyScale);
+    let outRows  = Math.ceil(origRows / xyScale);
+
+    // If still above cap, halve XY again (quarter resolution)
+    if (outCols * outRows * numSlices > VOXEL_CAP) {
+        xyScale *= 2;
+        outCols  = Math.ceil(origCols / xyScale);
+        outRows  = Math.ceil(origRows / xyScale);
+    }
+
+    // If still above cap after XY halving, increase zStep
+    let finalZStep = zStep;
+    while (outCols * outRows * Math.ceil(numSlices / (finalZStep / zStep)) > VOXEL_CAP && finalZStep < zStep * 8) {
+        finalZStep *= 2;
+    }
+    const extraZFactor = finalZStep / zStep;
+    const finalNumSlices = Math.ceil(numSlices / extraZFactor);
+    const finalZIndices  = zIndices.filter((_, i) => i % extraZFactor === 0);
+
     // Adjust spacing to maintain world-space dimensions
     const outSpX   = spacingX * xyScale;
     const outSpY   = spacingY * xyScale;
+    // Update variables for the rest of the function
+    const adjustedNumSlices = finalNumSlices;
+    const adjustedZIndices  = finalZIndices;
+
+    console.log(`Volume: ${origCols}×${origRows}×${zPairs.length} → ${outCols}×${outRows}×${adjustedNumSlices} (xyScale=${xyScale}, zStep=${finalZStep})`);
+    
 
     // ── Step 4: Load & downsample pixel data (one slice at a time) ────────────
-    const totalOut  = outCols * outRows * numSlices;
+    const totalOut   = outCols * outRows * adjustedNumSlices;
     const scalarData = new Int16Array(totalOut);
 
-    for (let si = 0; si < numSlices; si++) {
-        const zIdx = zIndices[si];
+    for (let si = 0; si < adjustedNumSlices; si++) {
+        const zIdx = adjustedZIndices[si];
         const sp   = await readRawSlice(zPairs[zIdx].file);
 
         if (sp && sp.rows === origRows && sp.cols === origCols) {
@@ -177,12 +205,10 @@ export async function createVolumeFromFiles(
             const dstBase = si * outCols * outRows;
 
             if (xyScale === 1) {
-                // No XY downsampling — direct copy with HU rescale
                 for (let j = 0; j < origCols * origRows; j++) {
                     scalarData[dstBase + j] = Math.round(raw[j] * slope + intercept);
                 }
             } else {
-                // Nearest-neighbour XY halving
                 for (let r = 0; r < outRows; r++) {
                     for (let c = 0; c < outCols; c++) {
                         const srcIdx = (r * xyScale) * origCols + (c * xyScale);
@@ -191,22 +217,21 @@ export async function createVolumeFromFiles(
                     }
                 }
             }
-            // sp._ab goes out of scope → eligible for GC
         }
 
-        onProgress?.(Math.round((si + 1) / numSlices * 100));
-        await new Promise<void>(r => setTimeout(r, 0)); // yield → GC opportunity
+        onProgress?.(Math.round((si + 1) / adjustedNumSlices * 100));
+        await new Promise<void>(r => setTimeout(r, 0));
     }
 
     // ── Step 5: Build vtkImageData ─────────────────────────────────────────────
     const imageData = vtkImageData.newInstance({
         origin,
-        spacing: [outSpX, outSpY, spacingZ],
-        extent:  [0, outCols - 1, 0, outRows - 1, 0, numSlices - 1],
+        spacing: [outSpX, outSpY, spacingZ * (finalZStep / zStep)],
+        extent:  [0, outCols - 1, 0, outRows - 1, 0, adjustedNumSlices - 1],
     });
     imageData.getPointData().setScalars(
         vtkDataArray.newInstance({ name: 'Scalars', values: scalarData }),
     );
 
-    return { imageData, xyScale, origCols, origRows, numSlices, zStep };
+    return { imageData, xyScale, origCols, origRows, numSlices: adjustedNumSlices, zStep: finalZStep };
 }

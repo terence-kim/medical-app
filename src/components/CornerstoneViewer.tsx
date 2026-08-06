@@ -107,11 +107,12 @@ interface CornerstoneViewerProps {
     brushHuMin?:     number;
     /** HU max for the selective (threshold) brush */
     brushHuMax?:     number;
-    onLabelMapChange?:     (labelMapData: Uint8Array) => void;
     onMetadataChange?:     (metadata: DicomMetadata | null) => void;
     /** Reports 0-100 fill progress (null = idle) */
     onFillProgressChange?: (pct: number | null) => void;
-    /** Exposes fillCurrentSlice / fillAllSlices imperative methods */
+    /** Ref populated by VTKViewer — sendTo3D pushes labelmap data directly (no React state copy) */
+    vtkRefreshLabelMapRef?: React.MutableRefObject<((data: Uint8Array) => void) | null>;
+    /** Exposes fillCurrentSlice / fillAllSlices / sendTo3D imperative methods */
     imperativeRef?:  React.MutableRefObject<CornerstoneViewerHandle | null>;
 }
 
@@ -146,7 +147,6 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     const brushHuMax    = props.brushHuMax ?? activeMask?.huMax ?? 3071;
 
     const isCT = modality === 'CT';
-    const freeBrushMode = false; // always use selective brush when CT
 
     // Refs that let renderSegOverlay (useCallback with [] deps) access current state
     const showHuPreviewRef = useRef(false);
@@ -172,8 +172,6 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const extMasksRef = useRef<any[]>(extMasks);
     // Always-fresh refs so event handlers never need stale closures
-    const autoUpdate3DTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const extractLabelMapRef    = useRef<() => Promise<void>>(async () => {});
     const renderSegOverlayRef   = useRef<() => void>(() => {});
 
@@ -188,7 +186,7 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     // isBrushingRef: true while a brush/eraser stroke is in progress — suppresses preview
     const isBrushingRef      = useRef(false);
 
-    const { onLabelMapChange, onMetadataChange, onFillProgressChange, imperativeRef, brushModeTick } = props;
+    const { onMetadataChange, onFillProgressChange, imperativeRef, brushModeTick, vtkRefreshLabelMapRef } = props;
 
     // ── Cornerstone init (runs once per mount) ────────────────────────────────
     useEffect(() => {
@@ -478,7 +476,6 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
                 } catch { /* fall through */ }
             }
             if (!pd) {
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 try { pd = (segMod.getters.labelmap2D(element)?.labelmap2D?.pixelData as Uint8Array) ?? null; } catch { return; }
             }
 
@@ -785,7 +782,9 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             }
         }
 
-        onLabelMapChange?.(labelMapData);
+        // Push directly to VTKViewer (zero React-state copy)
+        vtkRefreshLabelMapRef?.current?.(labelMapData);
+        // Allow the caller to collect the temporary buffer after VTK stores its own copy
     };
 
     // Keep refs always pointing to current values / closures so that
@@ -1055,7 +1054,6 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
                 try { segMod.setters.activeSegmentIndex(element, activeMask?.segmentIndex ?? 1); } catch { /* ok */ }
 
                 const res    = segMod.getters.labelmap2D(element);
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 labelmapPd   = (res?.labelmap2D?.pixelData as Uint8Array) ?? null;
 
                 // If labelmap2D returns null, force-allocate one for this slice
@@ -1159,7 +1157,6 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             fillAllSlices,
             sendTo3D: () => { extractLabelMapRef.current?.(); },
         };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [fillCurrentSlice, fillAllSlices, imperativeRef]);
 
     // Propagate fill progress to parent

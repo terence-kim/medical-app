@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import '@kitware/vtk.js/Rendering/Profiles/Geometry';
 import '@kitware/vtk.js/Rendering/Profiles/Volume';
 import vtkFullScreenRenderWindow from '@kitware/vtk.js/Rendering/Misc/FullScreenRenderWindow';
@@ -24,13 +24,13 @@ interface VTKViewerProps {
     files?: File[] | null;
     /** Named mask list from App.tsx — used for surface mesh colors and segment indices */
     masks?: Mask[];
-    labelMapData?: Uint8Array | null;
-    modality?: string;
     onError?: (message: string) => void;
     /** Called when generating status changes */
     onGeneratingChange?: (v: boolean) => void;
     /** Imperative ref — parent calls ref.current() to trigger Generate Model */
     generateRef?: React.MutableRefObject<(() => void) | null>;
+    /** Parent populates this ref so CornerstoneViewer can push labelmap directly (no state copy) */
+    refreshLabelMapRef?: React.MutableRefObject<((data: Uint8Array) => void) | null>;
 }
 
 type FullScreenRenderer = ReturnType<typeof vtkFullScreenRenderWindow.newInstance>;
@@ -43,14 +43,13 @@ interface VtkContext {
     maskVolume: VtkVolumeActor | null;
 }
 
-function VTKViewer({ files, masks = [], labelMapData, modality, onError, onGeneratingChange, generateRef }: VTKViewerProps) {
+function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef, refreshLabelMapRef }: VTKViewerProps) {
     const vtkContainerRef = useRef<HTMLDivElement>(null);
     const context = useRef<VtkContext | null>(null);
     const [isLoading,      setIsLoading]      = useState(false);
     const [loadProgress,   setLoadProgress]   = useState(0);
     const [isGenerated,    setIsGenerated]    = useState(false);
     const [hasMeshes,      setHasMeshes]      = useState(false);
-    const isCT = modality === 'CT';
 
     // Refs for surface mesh actors — cleaned up before each Generate Model run
     const meshActorsRef = useRef<VtkActorInstance[]>([]);
@@ -82,7 +81,7 @@ function VTKViewer({ files, masks = [], labelMapData, modality, onError, onGener
     const toggleOrgan = (id: string) => {
         setActiveOrgans(prev => {
             const next = new Set(prev);
-            next.has(id) ? next.delete(id) : next.add(id);
+            if (next.has(id)) { next.delete(id); } else { next.add(id); }
             return next;
         });
     };
@@ -762,7 +761,7 @@ function VTKViewer({ files, masks = [], labelMapData, modality, onError, onGener
         meshActorsRef.current.forEach(a => renderer.removeActor(a));
         meshActorsRef.current = [];
 
-        // Helper: build binary image data + run marching cubes + add actor
+        // Helper: build VTK mesh actor from a pre-built binary Uint8Array
         const buildMesh = async (binary: Uint8Array, r: number, g: number, b: number) => {
             const maskImg = vtkImageData.newInstance();
             maskImg.setDimensions([W, H, D]);
@@ -793,22 +792,49 @@ function VTKViewer({ files, masks = [], labelMapData, modality, onError, onGener
             await new Promise<void>(res => setTimeout(res, 0));
         };
 
-        // 1. HU-based meshes (from CT scalars)
+        // 1. HU-based meshes — generate binary masks in a Web Worker to keep main thread free
         const ct = ctScalarsRef.current;
-        for (const org of huBasedOrgs) {
-            const binary = new Uint8Array(totalVox);
-            if (ct) {
-                for (let i = 0; i < totalVox; i++) {
-                    binary[i] = ct[i] >= org.huMin && ct[i] <= org.huMax ? 1 : 0;
-                }
+        if (huBasedOrgs.length > 0 && ct) {
+            const binaryResults = await new Promise<{ id: string; binary: Uint8Array }[]>((resolve) => {
+                const worker = new Worker(
+                    new URL('../workers/maskGenerator.worker.ts', import.meta.url),
+                    { type: 'module' },
+                );
+                worker.onmessage = (e: MessageEvent<{ results: { id: string; binary: Uint8Array }[] }>) => {
+                    worker.terminate();
+                    resolve(e.data.results);
+                };
+                worker.onerror = () => {
+                    // Fallback: generate on main thread if Worker fails
+                    worker.terminate();
+                    const fallback = huBasedOrgs.map(org => {
+                        const binary = new Uint8Array(totalVox);
+                        for (let i = 0; i < totalVox; i++) {
+                            binary[i] = ct[i] >= org.huMin && ct[i] <= org.huMax ? 1 : 0;
+                        }
+                        return { id: org.id, binary };
+                    });
+                    resolve(fallback);
+                };
+                // Copy (not transfer) ct scalars — we need to keep ctScalarsRef intact
+                worker.postMessage({
+                    ctScalars: new Int16Array(ct),
+                    organs: huBasedOrgs.map(o => ({ id: o.id, huMin: o.huMin, huMax: o.huMax })),
+                    totalVox,
+                });
+            });
+
+            for (const { id, binary } of binaryResults) {
+                const org = huBasedOrgs.find(o => o.id === id);
+                if (!org) continue;
+                const [r, g, b] = org.color;
+                await buildMesh(binary, r, g, b);
             }
-            const [r, g, b] = org.color;
-            await buildMesh(binary, r, g, b);
         }
 
-        // 2. Painted labelmap meshes (from 2D brush)
+        // 2. Painted labelmap meshes (from 2D brush) — run on main thread (small data)
         for (const mask of paintedMasks) {
-            if (huBasedOrgs.find(o => o.id === mask.id)) continue; // already done above
+            if (huBasedOrgs.find(o => o.id === mask.id)) continue;
             const binary = new Uint8Array(totalVox);
             for (let i = 0; i < totalVox && i < (labelMap?.length ?? 0); i++) {
                 binary[i] = labelMap![i] === mask.segmentIndex ? 1 : 0;
@@ -840,7 +866,7 @@ function VTKViewer({ files, masks = [], labelMapData, modality, onError, onGener
             }
         };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [isGenerated, labelMapData, volumeMetadata]);
+    }, [isGenerated, volumeMetadata]);
 
     // ── Mask colour transfer function (built once, reused) ───────────────────
     const maskCtfunRef = useRef<ReturnType<typeof vtkColorTransferFunction.newInstance> | null>(null);
@@ -876,10 +902,9 @@ function VTKViewer({ files, masks = [], labelMapData, modality, onError, onGener
         return { ctfun, ofun };
     };
 
-    // Handle LabelMap Data Update — fast in-place scalar update on second+ call
-    useEffect(() => {
-        if (!context.current || !labelMapData || !volumeMetadata || !isGenerated) return;
-
+    // ── Apply labelmap data (called directly by CornerstoneViewer — no React state copy) ─
+    const applyLabelMapData = useCallback((labelMapData: Uint8Array) => {
+        if (!context.current || !volumeMetadata) return;
         const { renderer, renderWindow } = context.current;
 
         // ── Downsample labelmap to match the CT volume resolution ─────────────
@@ -891,7 +916,8 @@ function VTKViewer({ files, masks = [], labelMapData, modality, onError, onGener
 
         let maskedData: Uint8Array;
         if (xyScale === 1 && zStep === 1) {
-            maskedData = new Uint8Array(labelMapData);
+            // Zero-copy path: reuse the incoming buffer directly
+            maskedData = labelMapData;
         } else {
             maskedData = new Uint8Array(outCols * outRows * outSlices);
             for (let si = 0; si < outSlices; si++) {
@@ -910,7 +936,6 @@ function VTKViewer({ files, masks = [], labelMapData, modality, onError, onGener
 
         // ── Fast path: update scalars in-place (no pipeline rebuild) ──────────
         if (context.current.maskVolume && maskScalarsRef.current && maskImageDataRef.current) {
-            // Replace underlying typed-array in the existing vtkDataArray
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             (maskScalarsRef.current as any).setData(maskedData, 1);
             maskScalarsRef.current.modified();
@@ -920,22 +945,22 @@ function VTKViewer({ files, masks = [], labelMapData, modality, onError, onGener
         }
 
         // ── Slow path: first-time mask volume creation ────────────────────────
-        const maskImageData = vtkImageData.newInstance();
-        maskImageData.setDimensions([outCols, outRows, outSlices]);
-        maskImageData.setSpacing(volumeMetadata.spacing as [number, number, number]);
-        maskImageData.setOrigin(volumeMetadata.origin as [number, number, number]);
-        maskImageData.setDirection(volumeMetadata.direction as unknown as number[]);
+        const maskImgData = vtkImageData.newInstance();
+        maskImgData.setDimensions([outCols, outRows, outSlices]);
+        maskImgData.setSpacing(volumeMetadata.spacing as [number, number, number]);
+        maskImgData.setOrigin(volumeMetadata.origin as [number, number, number]);
+        maskImgData.setDirection(volumeMetadata.direction as unknown as number[]);
 
         const dataArray = vtkDataArray.newInstance({
             name: 'Scalars', values: maskedData, numberOfComponents: 1,
         });
-        maskImageData.getPointData().setScalars(dataArray);
+        maskImgData.getPointData().setScalars(dataArray);
         maskScalarsRef.current   = dataArray;
-        maskImageDataRef.current = maskImageData;
+        maskImageDataRef.current = maskImgData;
 
         const maskActor  = vtkVolume.newInstance();
         const maskMapper = vtkVolumeMapper.newInstance();
-        maskMapper.setInputData(maskImageData);
+        maskMapper.setInputData(maskImgData);
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (maskMapper as any).setSampleDistance?.(volumeMetadata.spacing[2] * 2 || 2);
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -953,17 +978,22 @@ function VTKViewer({ files, masks = [], labelMapData, modality, onError, onGener
 
         renderer.addVolume(maskActor);
         context.current.maskVolume = maskActor;
-
         setSegOnlyMode(true);
 
         if (sliceModeRef.current) {
             applyClipPlanesToMapper(maskMapper, true);
             updateSlicePlanes(sliceIndexRef.current, slabThicknessRef.current);
         }
-
         renderWindow.render();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [labelMapData, volumeMetadata, isGenerated]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [volumeMetadata]);
+
+    // Populate refreshLabelMapRef so CornerstoneViewer (or any caller) can push
+    // labelmap data directly without going through React state.
+    useEffect(() => {
+        if (refreshLabelMapRef) refreshLabelMapRef.current = applyLabelMapData;
+        return () => { if (refreshLabelMapRef) refreshLabelMapRef.current = null; };
+    }, [applyLabelMapData, refreshLabelMapRef]);
 
     const captureScreenshot = async () => {
         if (!context.current) return;

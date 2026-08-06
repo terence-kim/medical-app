@@ -9,7 +9,6 @@ import './App.css'
 function App() {
   // ── File state ────────────────────────────────────────────────────────────
   const [selectedFiles,  setSelectedFiles]  = useState<File[] | null>(null);
-  const [labelMapData,   setLabelMapData]   = useState<Uint8Array | null>(null);
   const [caseMeta,       setCaseMeta]       = useState<DicomMetadata | null>(null);
   const [toast,          setToast]          = useState<string | null>(null);
   const [viewMode,       setViewMode]       = useState<'2d' | 'mpr'>('2d');
@@ -29,11 +28,15 @@ function App() {
   const [isGenerating,   setIsGenerating]   = useState(false);
 
   // ── VTK / 3D ──────────────────────────────────────────────────────────────
-  // Callback refs so VTKViewer can expose imperative actions
-  const vtkGenerateRef     = useRef<(() => void) | null>(null);
-  const csViewerRef        = useRef<{
+  // generateRef: parent calls ref.current() to trigger 3D generation in VTKViewer
+  const vtkGenerateRef      = useRef<(() => void) | null>(null);
+  // refreshLabelMapRef: VTKViewer populates this; CornerstoneViewer calls it to push
+  // the labelmap directly (zero React-state copy)
+  const vtkRefreshLabelMapRef = useRef<((data: Uint8Array) => void) | null>(null);
+  const csViewerRef           = useRef<{
     fillCurrentSlice: () => void;
     fillAllSlices:    () => void;
+    sendTo3D:         () => void;
   } | null>(null);
 
   // Sync active mask HU range to brush when mask changes
@@ -71,7 +74,6 @@ function App() {
       });
       if (candidateFiles.length > 0) {
         setSelectedFiles(candidateFiles);
-        setLabelMapData(null);
         setCaseMeta(null);
       } else {
         showToast('선택한 폴더/파일에서 사용 가능한 DICOM 파일을 찾지 못했습니다.');
@@ -176,9 +178,9 @@ function App() {
               brushModeTick={brushModeTick}
               brushHuMin={brushHuMin}
               brushHuMax={brushHuMax}
-              onLabelMapChange={setLabelMapData}
               onMetadataChange={setCaseMeta}
               onFillProgressChange={setFillProgress}
+              vtkRefreshLabelMapRef={vtkRefreshLabelMapRef}
               imperativeRef={csViewerRef}
             />
           </div>
@@ -200,11 +202,10 @@ function App() {
             <VTKViewer
               files={selectedFiles}
               masks={masks}
-              labelMapData={labelMapData}
-              modality={caseMeta?.modality}
               onError={showToast}
               onGeneratingChange={setIsGenerating}
               generateRef={vtkGenerateRef}
+              refreshLabelMapRef={vtkRefreshLabelMapRef}
             />
           </div>
         </div>
