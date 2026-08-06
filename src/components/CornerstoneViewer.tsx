@@ -69,22 +69,25 @@ const TISSUE_TYPES: TissueType[] = [
     },
 ];
 
-// Pre-built segment colour LUT — computed once at module load, reused every frame.
+// Segment colour LUT — rebuilt dynamically from extMasks.
 // Layout: [r0,g0,b0,a0, r1,g1,b1,a1, …]  (a=0 means transparent / unused index)
 const SEG_LUT_SIZE = 16;
-const SEG_LUT = (() => {
+
+/** Build an RGBA LUT from the current mask list + opacity (0-1). */
+function buildSegLut(masks: { segmentIndex: number; color: [number, number, number]; visible?: boolean }[], opacity: number): Uint8Array {
     const lut = new Uint8Array(SEG_LUT_SIZE * 4);
-    for (const t of TISSUE_TYPES) {
-        const o = t.segmentIndex * 4;
-        if (o + 3 < lut.length) {
-            lut[o]     = t.color[0];
-            lut[o + 1] = t.color[1];
-            lut[o + 2] = t.color[2];
-            lut[o + 3] = 185; // ≈ 0.72 opacity
+    const alpha = Math.round(Math.min(1, Math.max(0, opacity)) * 255);
+    for (const m of masks) {
+        const o = m.segmentIndex * 4;
+        if (o + 3 < lut.length && m.visible !== false) {
+            lut[o]     = m.color[0];
+            lut[o + 1] = m.color[1];
+            lut[o + 2] = m.color[2];
+            lut[o + 3] = alpha;
         }
     }
     return lut;
-})();
+}
 
 // ── Imperative handle exposed to App.tsx via ref ──────────────────────────────
 export interface CornerstoneViewerHandle {
@@ -130,8 +133,9 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     const [fillProgress, setFillProgress] = useState<number | null>(null);
 
     // Segmentation state
-    const [brushSize,  setBrushSize]  = useState(20);
-    const [modality,   setModality]   = useState('');
+    const [brushSize,       setBrushSize]       = useState(20);
+    const [overlayOpacity,  setOverlayOpacity]  = useState(0.78);
+    const [modality,        setModality]        = useState('');
     // Internal tool: 'Wwwc' (default), 'Brush', 'Eraser', 'Length', 'Angle'
     const [activeTool,  setActiveTool] = useState('Wwwc');
 
@@ -168,6 +172,8 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     const totalImagesRef  = useRef(0);
     // Canvas overlay for rendering the segmentation in the correct tissue colours.
     const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
+    // Separate top-most canvas just for the brush/eraser cursor circle (updated on every mousemove)
+    const cursorCanvasRef  = useRef<HTMLCanvasElement>(null);
     const offscreenRef     = useRef<HTMLCanvasElement | null>(null);
 
     // Ref to current extMasks for use inside fillAllSlicesForOrgan callback
@@ -176,6 +182,16 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     // Always-fresh refs so event handlers never need stale closures
     const extractLabelMapRef    = useRef<() => Promise<void>>(async () => {});
     const renderSegOverlayRef   = useRef<() => void>(() => {});
+
+    // Dynamic colour LUT — rebuilt from extMasks + overlayOpacity on every render
+    const segLutRef         = useRef<Uint8Array>(buildSegLut(extMasks, 0.78));
+    // Cursor tracking refs (read inside renderCursor, a stable useCallback)
+    const activeToolRef     = useRef(activeTool);
+    const brushSizeRef      = useRef(brushSize);
+    const overlayOpacityRef = useRef(overlayOpacity);
+    const mousePageXRef     = useRef(0);
+    const mousePageYRef     = useRef(0);
+    const mouseOnElRef      = useRef(false);
 
     // Performance-critical refs for renderSegOverlay
     // imgDataRef: reused ImageData buffer — avoids 1 MB allocation per frame
@@ -563,17 +579,18 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             }
 
             // ── Layer 2: Painted segmentation (on top of preview) ─────────────
-            // Uses the module-level SEG_LUT (built once at load time, never rebuilt).
+            // Uses the dynamic segLutRef (rebuilt from extMasks + overlayOpacity).
             if (hasSegData && pd) {
+                const lut = segLutRef.current;
                 for (let i = 0; i < pd.length; i++) {
                     const seg = pd[i];
                     if (!seg || seg >= SEG_LUT_SIZE) continue;
                     const lo = seg * 4;
-                    if (SEG_LUT[lo + 3] === 0) continue;
-                    buf[i * 4]     = SEG_LUT[lo];
-                    buf[i * 4 + 1] = SEG_LUT[lo + 1];
-                    buf[i * 4 + 2] = SEG_LUT[lo + 2];
-                    buf[i * 4 + 3] = SEG_LUT[lo + 3];
+                    if (lut[lo + 3] === 0) continue;
+                    buf[i * 4]     = lut[lo];
+                    buf[i * 4 + 1] = lut[lo + 1];
+                    buf[i * 4 + 2] = lut[lo + 2];
+                    buf[i * 4 + 3] = lut[lo + 3];
                     hasPaint = true;
                 }
             }
@@ -604,6 +621,87 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             console.warn('renderSegOverlay error:', err);
         }
     }, []);
+
+    // ── Brush / Eraser cursor rendering (separate thin canvas, high-freq) ────────
+    // Keeps the cursor circle updating at mousemove speed without re-running the
+    // expensive segmentation overlay loop.
+    const renderCursor = useCallback(() => {
+        const element = elementRef.current;
+        const canvas  = cursorCanvasRef.current;
+        if (!element || !canvas) return;
+
+        const tool = activeToolRef.current;
+        const csCanvas = element.querySelector('canvas');
+        const cw = csCanvas ? csCanvas.width  : element.clientWidth;
+        const ch = csCanvas ? csCanvas.height : element.clientHeight;
+        if (canvas.width !== cw || canvas.height !== ch) { canvas.width = cw; canvas.height = ch; }
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        ctx.clearRect(0, 0, cw, ch);
+
+        if ((tool !== 'Brush' && tool !== 'Eraser') || !mouseOnElRef.current) return;
+
+        try {
+            const image = cornerstone.getImage(element);
+            if (!image) return;
+            const vp = cornerstone.getViewport(element);
+            if (!vp) return;
+
+            const { width, height } = image;
+            const scale = vp.scale ?? 1;
+            const tx    = vp.translation?.x ?? 0;
+            const ty    = vp.translation?.y ?? 0;
+            const coords = cornerstone.pageToPixel(element, mousePageXRef.current, mousePageYRef.current);
+            const cx = cw / 2 + tx + (coords.x - width  / 2) * scale;
+            const cy = ch / 2 + ty + (coords.y - height / 2) * scale;
+            const radius = Math.max(2, brushSizeRef.current * scale);
+
+            const isErase = tool === 'Eraser';
+            ctx.beginPath();
+            ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+            ctx.strokeStyle = isErase ? 'rgba(255,100,100,0.95)' : 'rgba(100,220,255,0.95)';
+            ctx.fillStyle   = isErase ? 'rgba(255,50,50,0.10)'   : 'rgba(100,220,255,0.08)';
+            ctx.lineWidth   = 1.5;
+            ctx.setLineDash([5, 3]);
+            ctx.fill();
+            ctx.stroke();
+            ctx.setLineDash([]);
+            // Center dot
+            ctx.beginPath();
+            ctx.arc(cx, cy, 1.5, 0, Math.PI * 2);
+            ctx.fillStyle = isErase ? 'rgba(255,100,100,0.9)' : 'rgba(100,220,255,0.9)';
+            ctx.fill();
+        } catch { /* ignore */ }
+    }, []);
+
+    // Mouse tracking → cursor updates
+    useEffect(() => {
+        const element = elementRef.current;
+        if (!element || !isReady) return;
+        let rafId: number | null = null;
+        const schedule = () => {
+            if (!rafId) rafId = requestAnimationFrame(() => { rafId = null; renderCursor(); });
+        };
+        const onMove  = (e: MouseEvent) => {
+            mousePageXRef.current = e.pageX;
+            mousePageYRef.current = e.pageY;
+            schedule();
+        };
+        const onEnter = () => { mouseOnElRef.current = true;  };
+        const onLeave = () => { mouseOnElRef.current = false; renderCursor(); };
+        element.addEventListener('mousemove',  onMove);
+        element.addEventListener('mouseenter', onEnter);
+        element.addEventListener('mouseleave', onLeave);
+        return () => {
+            element.removeEventListener('mousemove',  onMove);
+            element.removeEventListener('mouseenter', onEnter);
+            element.removeEventListener('mouseleave', onLeave);
+            if (rafId) cancelAnimationFrame(rafId);
+        };
+    }, [isReady, renderCursor]);
+
+    // Also refresh cursor when tool / brush size changes
+    useEffect(() => { renderCursor(); }, [activeTool, brushSize, renderCursor]);
 
     // Refresh overlay on every cornerstone render (covers zoom, pan, W/L, slice change).
     // Refresh overlay on cornerstone render and after each tool stroke.
@@ -800,6 +898,12 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     customHuMaxRef.current       = brushHuMax;
     isCTRef.current              = isCT;
     extMasksRef.current          = extMasks;
+    // Cursor / LUT refs — stay in sync with latest state
+    activeToolRef.current        = activeTool;
+    brushSizeRef.current         = brushSize;
+    overlayOpacityRef.current    = overlayOpacity;
+    // Rebuild LUT whenever masks or opacity changes
+    segLutRef.current            = buildSegLut(extMasks, overlayOpacity);
 
     // Re-render overlay when active mask or HU range changes
     useEffect(() => {
@@ -950,17 +1054,55 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
         });
 
         const segMod = cornerstoneTools.getModule('segmentation');
+
+        // Ensure the segmentation module is initialised for this element
         try { segMod.setters.activeLabelmapIndex(element, 0); } catch { /* ok */ }
+        // Force a dummy segmentation read so cornerstoneTools initialises the
+        // series state entry even if the user has never activated a brush tool.
+        try { segMod.getters.labelmap2D(element); } catch { /* ok */ }
+
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const ee   = cornerstone.getEnabledElement(element) as any;
         const uuid = ee?.uuid;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const ss   = segMod.state?.series?.[uuid] as any;
+        let ss   = segMod.state?.series?.[uuid] as any;
+
+        // If series state still doesn't exist, create a minimal placeholder so
+        // we can write labelmaps2D entries directly.
+        if (!ss && uuid) {
+            if (!segMod.state.series) segMod.state.series = {};
+            segMod.state.series[uuid] = {
+                activeLabelmapIndex: 0,
+                labelmaps3D: [{
+                    labelmaps2D: [],
+                    metadata: [],
+                    activeSegmentIndex: 1,
+                    segmentsHidden: [],
+                    undo: [],
+                    redo: [],
+                }],
+            };
+            ss = segMod.state.series[uuid];
+        }
         if (!ss) return;
+
         const ai  = ss.activeLabelmapIndex ?? 0;
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const lm3D = ss.labelmaps3D?.[ai] as any;
-        if (!lm3D) return;
+        let lm3D = ss.labelmaps3D?.[ai] as any;
+
+        // Similarly, create lm3D if it's missing
+        if (!lm3D) {
+            if (!ss.labelmaps3D) ss.labelmaps3D = [];
+            ss.labelmaps3D[ai] = {
+                labelmaps2D: [],
+                metadata: [],
+                activeSegmentIndex: 1,
+                segmentsHidden: [],
+                undo: [],
+                redo: [],
+            };
+            lm3D = ss.labelmaps3D[ai];
+        }
 
         setFillProgress(0);
         for (let i = 0; i < files.length; i++) {
@@ -1300,6 +1442,17 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
 
                 <div className="w-px h-5 bg-[#333] mx-0.5" />
 
+                {/* Overlay opacity */}
+                <div className="flex items-center gap-1 shrink-0" title="세그멘테이션 오버레이 투명도">
+                    <span className="text-[9px] text-slate-500">투명도</span>
+                    <input type="range" min="10" max="100" step="5" value={Math.round(overlayOpacity * 100)}
+                        onChange={e => { const v = Number(e.target.value) / 100; setOverlayOpacity(v); overlayOpacityRef.current = v; renderSegOverlayRef.current?.(); }}
+                        className="w-12 h-1 appearance-none rounded accent-sky-500 bg-[#333] cursor-pointer" />
+                    <span className="text-[9px] text-slate-400 w-5 tabular-nums">{Math.round(overlayOpacity * 100)}%</span>
+                </div>
+
+                <div className="w-px h-5 bg-[#333] mx-0.5" />
+
                 {/* Zoom */}
                 <TbBtn onClick={() => zoomViewport(1/1.25)} title="Zoom out">−</TbBtn>
                 <TbBtn onClick={resetView} title="Reset view">⊡</TbBtn>
@@ -1345,9 +1498,15 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
                     className="absolute inset-0"
                     onContextMenu={e => e.preventDefault()}
                 />
-                {/* pointer-events-none so the canvas never intercepts mouse events */}
+                {/* Segmentation colour overlay (below cursor) */}
                 <canvas
                     ref={overlayCanvasRef}
+                    className="absolute inset-0 pointer-events-none"
+                    style={{ width: '100%', height: '100%' }}
+                />
+                {/* Brush/eraser cursor circle (topmost, updated on every mousemove via RAF) */}
+                <canvas
+                    ref={cursorCanvasRef}
                     className="absolute inset-0 pointer-events-none"
                     style={{ width: '100%', height: '100%' }}
                 />
