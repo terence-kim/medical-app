@@ -193,6 +193,10 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     const mousePageYRef     = useRef(0);
     const mouseOnElRef      = useRef(false);
 
+    // Debounced auto-3D push: fires 500 ms after the last brush stroke on mouseup.
+    // Uses the fast in-place VTK scalar update (no pipeline rebuild) so it's cheap.
+    const auto3DTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
     // Performance-critical refs for renderSegOverlay
     // imgDataRef: reused ImageData buffer — avoids 1 MB allocation per frame
     const imgDataRef         = useRef<ImageData | null>(null);
@@ -426,27 +430,26 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
         const imageId = imageIds[newIdx];
         if (!imageId) return;
 
-        // Use loadImage (same API as initial display) — loadAndCacheImage may not
-        // be available in all cornerstone-core builds; loadImage always works.
+        // Update BOTH our ref AND cornerstoneTools' internal indices BEFORE loadImage
+        // starts (and certainly before cornerstoneimagerendered fires) so that
+        // renderSegOverlay always reads the correct labelmaps2D[newIdx].
+        currentIndexRef.current = newIdx;
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const ee = cornerstone.getEnabledElement(element) as any;
+            if (ee) ee.currentImageIdIndex = newIdx;
+        } catch { /* ignore */ }
+        try {
+            const ss = cornerstoneTools.getToolState(element, 'stack');
+            if (ss?.data?.[0]) ss.data[0].currentImageIdIndex = newIdx;
+        } catch { /* ignore */ }
+
+        setCurrentImageIndex(newIdx); // React state for UI counter
+
         cornerstone.loadImage(imageId).then((img) => {
-            // Update our ref BEFORE displayImage so that the cornerstoneimagerendered
-            // handler (renderSegOverlay) reads the correct slice index when it fires.
-            currentIndexRef.current = newIdx;
-
-            // Keep cornerstoneTools' internal indices in sync so getters.labelmap2D()
-            // returns the correct labelmap for this slice.
-            try {
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                const ee = cornerstone.getEnabledElement(element) as any;
-                if (ee) ee.currentImageIdIndex = newIdx;
-            } catch { /* ignore */ }
-            try {
-                const ss = cornerstoneTools.getToolState(element, 'stack');
-                if (ss?.data?.[0]) ss.data[0].currentImageIdIndex = newIdx;
-            } catch { /* ignore */ }
-
             cornerstone.displayImage(element, img);
-            setCurrentImageIndex(newIdx);
+            // renderSegOverlay fires via cornerstoneimagerendered — currentIndexRef
+            // is already correct so the right slice's labelmap is shown.
         }).catch(err => console.error('navigateSlice: loadImage failed', err));
     }, []);
 
@@ -537,11 +540,15 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             let hasPaint = false;
 
             // ── Layer 1: HU range preview (cached, blit-only on cache hit) ────
-            // The raw-pixel loop runs once per image+tissue+HU combination and is
-            // cached; subsequent calls with the same parameters just memcpy the
-            // 1 MB result buffer (~0.1 ms) instead of recomputing (~3 ms).
+            // Shown as a light, desaturated stipple so it's clearly "preview, not yet
+            // painted" — the fully-opaque solid colours in Layer 2 indicate confirmed
+            // segmentation.
             if (hasPreview) {
-                const tissue    = TISSUE_TYPES.find(t => t.id === activeTissueRef.current) ?? TISSUE_TYPES[0];
+                // Resolve colour from extMasks first (user may have customised it),
+                // fall back to the built-in TISSUE_TYPES entry.
+                const extMaskEntry = extMasksRef.current?.find((m: { id: string }) => m.id === activeTissueRef.current);
+                const fallbackTissue = TISSUE_TYPES.find(t => t.id === activeTissueRef.current) ?? TISSUE_TYPES[0];
+                const previewColor: [number,number,number] = extMaskEntry?.color ?? fallbackTissue.color;
                 const huMin     = customHuMinRef.current;
                 const huMax     = customHuMaxRef.current;
                 const imageId   = image.imageId ?? '';
@@ -557,16 +564,17 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
                     const rawPx     = (image.getPixelData() as any) as (Int16Array | Uint16Array);
                     const slope     = image.slope     ?? 1;
                     const intercept = image.intercept ?? 0;
-                    const [pr, pg, pb] = tissue.color;
+                    const [pr, pg, pb] = previewColor;
                     const pbuf = new Uint8ClampedArray(width * height * 4);
                     let hasP = false;
                     for (let i = 0; i < width * height; i++) {
                         const hu = rawPx[i] * slope + intercept;
                         if (hu >= huMin && hu <= huMax) {
-                            pbuf[i * 4]     = pr;
-                            pbuf[i * 4 + 1] = pg;
-                            pbuf[i * 4 + 2] = pb;
-                            pbuf[i * 4 + 3] = 65;
+                            // White-blend: mix colour with white at ~35% for a lighter tint
+                            pbuf[i * 4]     = Math.round(pr * 0.55 + 255 * 0.45);
+                            pbuf[i * 4 + 1] = Math.round(pg * 0.55 + 255 * 0.45);
+                            pbuf[i * 4 + 2] = Math.round(pb * 0.55 + 255 * 0.45);
+                            pbuf[i * 4 + 3] = 55; // semi-transparent "ghost"
                             hasP = true;
                         }
                     }
@@ -1354,8 +1362,16 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
             needsRender = false;
 
-            // Final full re-render (once, after stroke is complete).
+            // Final full 2D re-render (once, after stroke is complete).
             try { cornerstone.updateImage(element); } catch { /* ignore */ }
+
+            // Debounced auto-3D push: updates the 3D mask volume overlay 500 ms after
+            // the last stroke so the 3D view stays in sync without per-stroke overhead.
+            if (auto3DTimerRef.current) clearTimeout(auto3DTimerRef.current);
+            auto3DTimerRef.current = setTimeout(() => {
+                auto3DTimerRef.current = null;
+                extractLabelMapRef.current?.();
+            }, 500);
 
             // Clear per-stroke cache
             labelmapPd = null; rawPixels = null;
