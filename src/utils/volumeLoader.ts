@@ -80,7 +80,9 @@ async function readRawSlice(file: File): Promise<RawSlice | null> {
         const pixRep    = ds.uint16('x00280103') ?? 0;
         const slope     = parseFloat(ds.string('x00281053') ?? '1') || 1;
         const intercept = parseFloat(ds.string('x00281052') ?? '0') || 0;
-        const pixElem   = ds.elements['x7fe00010'];
+        type DicomElement = { dataOffset: number };
+        const elements = (ds as unknown as { elements: Record<string, DicomElement> }).elements;
+        const pixElem   = elements['x7fe00010'];
         if (!pixElem || rows === 0 || cols === 0) return null;
 
         const count = rows * cols;

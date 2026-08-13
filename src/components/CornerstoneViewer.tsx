@@ -28,9 +28,9 @@ interface TissueType {
 
 const TISSUE_TYPES: TissueType[] = [
     {
-        id: 'bone',    label: '뼈 (Bone)',       labelShort: '뼈',
-        segmentIndex: 1, color: [255, 210,  60, 255], colorCss: 'rgb(255,210,60)',
-        huMin: 400,   huMax: 3000,
+        id: 'bone',    label: 'bone',             labelShort: 'bone',
+        segmentIndex: 1, color: [255, 128, 153, 255], colorCss: 'rgb(255,128,153)',
+        huMin: 150,   huMax: 2000,
     },
     {
         id: 'liver',   label: '간 (Liver)',       labelShort: '간',
@@ -96,6 +96,13 @@ export interface CornerstoneViewerHandle {
     sendTo3D:         () => void;
     /** Apply multi-organ HU-based segmentation to every 2D slice (called after 3D generation). */
     applyOrgansSegmentation: (organs: { id: string; huMin: number; huMax: number }[]) => Promise<void>;
+    /** Apply a 3D labelmap (after lasso/sphere erase) back onto 2D slices. */
+    apply3DLabelMap: (info: {
+        data: Uint8Array;
+        volW: number; volH: number; volD: number;
+        xyScale: number; zStep: number;
+        previous?: Uint8Array;
+    }) => void;
 }
 
 interface CornerstoneViewerProps {
@@ -112,13 +119,23 @@ interface CornerstoneViewerProps {
     brushHuMin?:     number;
     /** HU max for the selective (threshold) brush */
     brushHuMax?:     number;
+    /** Controls whether HU Gate Preview overlay is visible — lifted to App to default OFF */
+    gatePreviewActive?: boolean;
+    /** Called when user toggles Gate Preview from within the viewer toolbar */
+    onGatePreviewChange?: (active: boolean) => void;
     onMetadataChange?:     (metadata: DicomMetadata | null) => void;
     /** Reports 0-100 fill progress (null = idle) */
     onFillProgressChange?: (pct: number | null) => void;
     /** Ref populated by VTKViewer — sendTo3D pushes labelmap data directly (no React state copy) */
     vtkRefreshLabelMapRef?: React.MutableRefObject<((data: Uint8Array) => void) | null>;
+    /** Live 3D update for the current slice while brushing */
+    vtkRefreshSliceRef?: React.MutableRefObject<((info: {
+        sliceIdx: number; pixelData: Uint8Array; width: number; height: number; numSlices: number;
+    }) => void) | null>;
     /** Exposes fillCurrentSlice / fillAllSlices / sendTo3D imperative methods */
     imperativeRef?:  React.MutableRefObject<CornerstoneViewerHandle | null>;
+    /** Called on every slice change — useful for crosshair sync in quad layout */
+    onSliceChange?:  (sliceIdx: number) => void;
 }
 
 const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneViewerProps) => {
@@ -141,7 +158,7 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
 
     // External props with fallback defaults
     const extMasks      = props.masks      ?? TISSUE_TYPES.map(t => ({
-        id: t.id, name: t.label, color: t.color as [number,number,number],
+        id: t.id, name: t.label, color: (t.color as unknown) as [number,number,number],
         colorCss: t.colorCss, visible: true, locked: false,
         segmentIndex: t.segmentIndex, huMin: t.huMin, huMax: t.huMax,
     }));
@@ -152,7 +169,8 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     const brushHuMin    = props.brushHuMin ?? activeMask?.huMin ?? -1024;
     const brushHuMax    = props.brushHuMax ?? activeMask?.huMax ?? 3071;
 
-    const isCT = modality === 'CT';
+    // Treat as CT for HU-based features if modality is CT or empty (unknown = assume CT)
+    const isCT = modality === 'CT' || modality === '' || modality === 'UNKNOWN';
 
     // Refs that let renderSegOverlay (useCallback with [] deps) access current state
     const showHuPreviewRef = useRef(false);
@@ -160,7 +178,11 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     const customHuMinRef   = useRef(brushHuMin);
     const customHuMaxRef   = useRef(brushHuMax);
     const isCTRef          = useRef(false);
+    const gatePreviewActiveRef = useRef(true);
 
+    // Last imageId that was confirmed fully displayed — used to guard renderSegOverlay
+    // so it never renders a different slice's overlay on the newly loaded image.
+    const lastRenderedImageIdRef = useRef<string | null>(null);
     // Exact imageIds created during file load — used by extractLabelMap() and navigation.
     const imageIdsRef    = useRef<string[]>([]);
     // Sorted File objects — used by fillAllSlicesForOrgan to read DICOM directly
@@ -193,9 +215,8 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     const mousePageYRef     = useRef(0);
     const mouseOnElRef      = useRef(false);
 
-    // Debounced auto-3D push: fires 500 ms after the last brush stroke on mouseup.
-    // Uses the fast in-place VTK scalar update (no pipeline rebuild) so it's cheap.
-    const auto3DTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const auto3DTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); // kept for legacy refs
 
     // Performance-critical refs for renderSegOverlay
     // imgDataRef: reused ImageData buffer — avoids 1 MB allocation per frame
@@ -208,7 +229,7 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     // isBrushingRef: true while a brush/eraser stroke is in progress — suppresses preview
     const isBrushingRef      = useRef(false);
 
-    const { onMetadataChange, onFillProgressChange, imperativeRef, brushModeTick, vtkRefreshLabelMapRef } = props;
+    const { onMetadataChange, onFillProgressChange, imperativeRef, brushModeTick, vtkRefreshLabelMapRef, vtkRefreshSliceRef } = props;
 
     // ── Cornerstone init (runs once per mount) ────────────────────────────────
     useEffect(() => {
@@ -280,15 +301,34 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
         };
     }, []);
 
-    // ── Keep Cornerstone canvas dimensions in sync with the container ─────────
+    // ── Keep Cornerstone canvas + overlay canvases in sync with the container ──
     useEffect(() => {
         const element = elementRef.current;
-        if (!element || !isReady) return;
-        const observer = new ResizeObserver(() => {
-            try { cornerstone.resize(element, true); } catch { /* element not yet loaded */ }
-        });
+        const overlay = overlayCanvasRef.current;
+        const cursor  = cursorCanvasRef.current;
+        if (!element) return;
+
+        const syncCanvasSize = () => {
+            // Resize Cornerstone's internal canvas
+            if (isReady) {
+                try { cornerstone.resize(element, true); } catch { /* element not yet loaded */ }
+            }
+            // Sync overlay and cursor canvases to match Cornerstone canvas
+            const csCanvas = element.querySelector('canvas');
+            const w = csCanvas ? csCanvas.width  : element.offsetWidth;
+            const h = csCanvas ? csCanvas.height : element.offsetHeight;
+            if (overlay && (overlay.width !== w || overlay.height !== h)) {
+                overlay.width = w; overlay.height = h;
+            }
+            if (cursor && (cursor.width !== w || cursor.height !== h)) {
+                cursor.width = w; cursor.height = h;
+            }
+        };
+
+        const observer = new ResizeObserver(syncCanvasSize);
         observer.observe(element);
         return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [isReady]);
 
     // ── HU picking in W/L mode → propagate to 3D bone threshold ──────────────
@@ -446,10 +486,23 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
 
         setCurrentImageIndex(newIdx); // React state for UI counter
 
+        // Notify parent about slice change (used for quad-layout crosshair sync)
+        props.onSliceChange?.(newIdx);
+
+        // Immediately clear overlay, bust HU preview cache, and reset the guard
+        // so renderSegOverlay won't render any stale data for the previous slice.
+        huPreviewCacheRef.current      = null;
+        lastRenderedImageIdRef.current = null;
+        const overlay = overlayCanvasRef.current;
+        if (overlay) {
+            const ctx2 = overlay.getContext('2d');
+            ctx2?.clearRect(0, 0, overlay.width, overlay.height);
+        }
+
         cornerstone.loadImage(imageId).then((img) => {
             cornerstone.displayImage(element, img);
-            // renderSegOverlay fires via cornerstoneimagerendered — currentIndexRef
-            // is already correct so the right slice's labelmap is shown.
+            // cornerstoneimagerendered fires here → renderSegOverlay shows the correct
+            // slice's labelmap data (currentIndexRef is already updated to newIdx).
         }).catch(err => console.error('navigateSlice: loadImage failed', err));
     }, []);
 
@@ -467,6 +520,64 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
         return () => window.removeEventListener('keydown', handle);
     }, [isReady, sortedFiles.length, navigateSlice]);
 
+    // ── Segmentation state initializer ───────────────────────────────────────
+    // cornerstoneTools segmentation state may not be created on first use.
+    // This helper ensures the ENTIRE state chain exists and returns the pixelData
+    // for the given slice. Returns null only if element is not ready.
+    const ensureLabelmapForSlice = useCallback((sliceIdx: number, w: number, h: number): Uint8Array | null => {
+        const element = elementRef.current;
+        if (!element) return null;
+        const segMod = cornerstoneTools.getModule('segmentation');
+        if (!segMod) return null;
+
+        // Step 1: try the normal API (creates state internally in some CS-tools versions)
+        try { segMod.setters.activeLabelmapIndex(element, 0); } catch { /* ok */ }
+
+        // Step 2 REMOVED: getters.labelmap2D() returns the CURRENT slice tracked by
+        // cornerstoneTools internally, which may differ from sliceIdx when scrolling fast.
+        // Always use the direct state-access path below to guarantee the right slice.
+
+        // Step 3: force-create the entire state chain
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const ee = cornerstone.getEnabledElement(element) as any;
+            const uuid = ee?.uuid;
+            if (!uuid) return null;
+
+            if (!segMod.state.series) segMod.state.series = {};
+            if (!segMod.state.series[uuid]) {
+                segMod.state.series[uuid] = {
+                    activeLabelmapIndex: 0,
+                    labelmaps3D: [],
+                };
+            }
+            const ss = segMod.state.series[uuid];
+            const ai = ss.activeLabelmapIndex ?? 0;
+            if (!ss.labelmaps3D) ss.labelmaps3D = [];
+            if (!ss.labelmaps3D[ai]) {
+                ss.labelmaps3D[ai] = {
+                    labelmaps2D: [], metadata: [],
+                    activeSegmentIndex: 1, segmentsHidden: [],
+                    undo: [], redo: [],
+                };
+            }
+            const lm3D = ss.labelmaps3D[ai];
+            if (!lm3D.labelmaps2D) lm3D.labelmaps2D = [];
+            if (!lm3D.labelmaps2D[sliceIdx]) {
+                lm3D.labelmaps2D[sliceIdx] = {
+                    pixelData: new Uint8Array(w * h),
+                    segmentsOnLabelmap: [],
+                    isVisible: true,
+                    isInterpolated: false,
+                };
+            }
+            return lm3D.labelmaps2D[sliceIdx].pixelData as Uint8Array;
+        } catch (err) {
+            console.warn('ensureLabelmapForSlice failed:', err);
+            return null;
+        }
+    }, []);
+
     // ── Segmentation colour overlay (own canvas, bypasses cornerstoneTools) ──
     // Reads the active labelmap for the current slice on every cornerstone render
     // (scroll, zoom, W/L, pan) and draws tissue-coloured pixels on an overlay
@@ -479,11 +590,33 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
         if (!ctx) return;
 
         try {
-            const image    = cornerstone.getImage(element);
-            const viewport = cornerstone.getViewport(element);
-            if (!image || !viewport) return;
+            const image = cornerstone.getImage(element);
+            if (!image) return;
 
-            // ── Labelmap pixel data ───────────────────────────────────────────
+            lastRenderedImageIdRef.current = image.imageId;
+
+            // ── Canvas size (always clear first — never leave a previous slice) ─
+            const csCanvas = element.querySelector('canvas');
+            const cw = csCanvas ? csCanvas.width  : element.clientWidth;
+            const ch = csCanvas ? csCanvas.height : element.clientHeight;
+            if (overlay.width !== cw || overlay.height !== ch) {
+                overlay.width  = cw;
+                overlay.height = ch;
+            } else {
+                ctx.setTransform(1, 0, 0, 1, 0, 0);
+                ctx.clearRect(0, 0, cw, ch);
+            }
+            if (csCanvas) {
+                overlay.style.width  = csCanvas.style.width  || `${csCanvas.clientWidth}px`;
+                overlay.style.height = csCanvas.style.height || `${csCanvas.clientHeight}px`;
+            }
+
+            // Bind overlay to the DISPLAYED image, not currentIndexRef.
+            // During fast scroll the displayed image can lag the index; using
+            // image.imageId guarantees we never paint slice N's mask onto slice N+1.
+            const displayedSlice = imageIdsRef.current.indexOf(image.imageId);
+            if (displayedSlice < 0) return;
+
             const segMod = cornerstoneTools.getModule('segmentation');
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const ee   = cornerstone.getEnabledElement(element) as any;
@@ -493,114 +626,37 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
                 try {
                     const ss = segMod.state?.series?.[uuid];
                     const ai = ss?.activeLabelmapIndex ?? 0;
-                    pd = ss?.labelmaps3D?.[ai]?.labelmaps2D?.[currentIndexRef.current]?.pixelData ?? null;
-                } catch { /* fall through */ }
-            }
-            if (!pd) {
-                try { pd = (segMod.getters.labelmap2D(element)?.labelmap2D?.pixelData as Uint8Array) ?? null; } catch { return; }
+                    pd = ss?.labelmaps3D?.[ai]?.labelmaps2D?.[displayedSlice]?.pixelData ?? null;
+                } catch { /* no labelmap for this slice */ }
             }
 
-            const hasSegData = pd !== null;
-            // Skip HU preview while the user is actively painting (too expensive per-frame).
-            // It is re-enabled on mouseup via the `isBrushingRef` flag.
-            const hasPreview = showHuPreviewRef.current && isCTRef.current && !isBrushingRef.current;
-
-            if (!hasSegData && !hasPreview) {
-                // Make sure canvas is clear if nothing to draw
-                const cs = element.querySelector('canvas');
-                const cw2 = cs ? cs.width : element.clientWidth;
-                const ch2 = cs ? cs.height : element.clientHeight;
-                if (overlay.width !== cw2 || overlay.height !== ch2) { overlay.width = cw2; overlay.height = ch2; }
-                else ctx.clearRect(0, 0, cw2, ch2);
-                return;
-            }
-
-            // ── Canvas size (avoid unnecessary DOM re-flows) ──────────────────
-            const csCanvas = element.querySelector('canvas');
-            const cw = csCanvas ? csCanvas.width  : element.clientWidth;
-            const ch = csCanvas ? csCanvas.height : element.clientHeight;
-            if (overlay.width !== cw || overlay.height !== ch) {
-                overlay.width  = cw; // also clears the canvas
-                overlay.height = ch;
-            } else {
-                ctx.clearRect(0, 0, cw, ch);
-            }
+            // Only painted pixels are drawn. HU preview of the whole slice is gone —
+            // Smart Brush filters HU inside the cursor circle at paint time instead.
+            if (!pd) return;
 
             const { width, height } = image;
+            if (pd.length !== width * height) return;
 
-            // ── Reuse ImageData (avoid 1 MB allocation per frame) ─────────────
             if (!imgDataRef.current
                 || imgDataRef.current.width  !== width
                 || imgDataRef.current.height !== height) {
                 imgDataRef.current = new ImageData(width, height);
             }
             const buf = imgDataRef.current.data;
-            buf.fill(0); // clear without realloc
+            buf.fill(0);
 
             let hasPaint = false;
-
-            // ── Layer 1: HU range preview (cached, blit-only on cache hit) ────
-            // Shown as a light, desaturated stipple so it's clearly "preview, not yet
-            // painted" — the fully-opaque solid colours in Layer 2 indicate confirmed
-            // segmentation.
-            if (hasPreview) {
-                // Resolve colour from extMasks first (user may have customised it),
-                // fall back to the built-in TISSUE_TYPES entry.
-                const extMaskEntry = extMasksRef.current?.find((m: { id: string }) => m.id === activeTissueRef.current);
-                const fallbackTissue = TISSUE_TYPES.find(t => t.id === activeTissueRef.current) ?? TISSUE_TYPES[0];
-                const previewColor: [number,number,number] = extMaskEntry?.color ?? fallbackTissue.color;
-                const huMin     = customHuMinRef.current;
-                const huMax     = customHuMaxRef.current;
-                const imageId   = image.imageId ?? '';
-                const prevCache = huPreviewCacheRef.current;
-
-                if (!prevCache
-                    || prevCache.imageId  !== imageId
-                    || prevCache.tissueId !== activeTissueRef.current
-                    || prevCache.huMin    !== huMin
-                    || prevCache.huMax    !== huMax) {
-                    // Cache miss — rebuild
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    const rawPx     = (image.getPixelData() as any) as (Int16Array | Uint16Array);
-                    const slope     = image.slope     ?? 1;
-                    const intercept = image.intercept ?? 0;
-                    const [pr, pg, pb] = previewColor;
-                    const pbuf = new Uint8ClampedArray(width * height * 4);
-                    let hasP = false;
-                    for (let i = 0; i < width * height; i++) {
-                        const hu = rawPx[i] * slope + intercept;
-                        if (hu >= huMin && hu <= huMax) {
-                            // White-blend: mix colour with white at ~35% for a lighter tint
-                            pbuf[i * 4]     = Math.round(pr * 0.55 + 255 * 0.45);
-                            pbuf[i * 4 + 1] = Math.round(pg * 0.55 + 255 * 0.45);
-                            pbuf[i * 4 + 2] = Math.round(pb * 0.55 + 255 * 0.45);
-                            pbuf[i * 4 + 3] = 55; // semi-transparent "ghost"
-                            hasP = true;
-                        }
-                    }
-                    huPreviewCacheRef.current = { imageId, tissueId: activeTissueRef.current, huMin, huMax, buf: pbuf, hasPixels: hasP };
-                }
-                if (huPreviewCacheRef.current.hasPixels) {
-                    buf.set(huPreviewCacheRef.current.buf); // ~0.1 ms memcpy
-                    hasPaint = true;
-                }
-            }
-
-            // ── Layer 2: Painted segmentation (on top of preview) ─────────────
-            // Uses the dynamic segLutRef (rebuilt from extMasks + overlayOpacity).
-            if (hasSegData && pd) {
-                const lut = segLutRef.current;
-                for (let i = 0; i < pd.length; i++) {
-                    const seg = pd[i];
-                    if (!seg || seg >= SEG_LUT_SIZE) continue;
-                    const lo = seg * 4;
-                    if (lut[lo + 3] === 0) continue;
-                    buf[i * 4]     = lut[lo];
-                    buf[i * 4 + 1] = lut[lo + 1];
-                    buf[i * 4 + 2] = lut[lo + 2];
-                    buf[i * 4 + 3] = lut[lo + 3];
-                    hasPaint = true;
-                }
+            const lut = segLutRef.current;
+            for (let i = 0; i < pd.length; i++) {
+                const seg = pd[i];
+                if (!seg || seg >= SEG_LUT_SIZE) continue;
+                const lo = seg * 4;
+                if (lut[lo + 3] === 0) continue;
+                buf[i * 4]     = lut[lo];
+                buf[i * 4 + 1] = lut[lo + 1];
+                buf[i * 4 + 2] = lut[lo + 2];
+                buf[i * 4 + 3] = lut[lo + 3];
+                hasPaint = true;
             }
 
             if (!hasPaint) return;
@@ -615,15 +671,22 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             }
             offscreenRef.current.getContext('2d')!.putImageData(imgDataRef.current, 0, 0);
 
-            // ── Viewport transform ────────────────────────────────────────────
-            ctx.setTransform(1, 0, 0, 1, 0, 0);
-            ctx.translate(cw / 2 + (viewport.translation?.x ?? 0), ch / 2 + (viewport.translation?.y ?? 0));
-            if (viewport.rotation) ctx.rotate(viewport.rotation * Math.PI / 180);
-            ctx.scale(
-                viewport.scale * (viewport.hflip ? -1 : 1),
-                viewport.scale * (viewport.vflip ? -1 : 1),
+            // Map image pixels → canvas using Cornerstone's own transform so pan/zoom/flip
+            // keep the overlay locked to the CT image.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const csAny = cornerstone as any;
+            const p0 = csAny.pixelToCanvas(element, { x: 0, y: 0 });
+            const pX = csAny.pixelToCanvas(element, { x: width, y: 0 });
+            const pY = csAny.pixelToCanvas(element, { x: 0, y: height });
+            ctx.setTransform(
+                (pX.x - p0.x) / width,
+                (pX.y - p0.y) / width,
+                (pY.x - p0.x) / height,
+                (pY.y - p0.y) / height,
+                p0.x,
+                p0.y,
             );
-            ctx.drawImage(offscreenRef.current, -width / 2, -height / 2);
+            ctx.drawImage(offscreenRef.current, 0, 0);
 
         } catch (err) {
             console.warn('renderSegOverlay error:', err);
@@ -643,6 +706,10 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
         const cw = csCanvas ? csCanvas.width  : element.clientWidth;
         const ch = csCanvas ? csCanvas.height : element.clientHeight;
         if (canvas.width !== cw || canvas.height !== ch) { canvas.width = cw; canvas.height = ch; }
+        if (csCanvas) {
+            canvas.style.width  = csCanvas.style.width  || `${csCanvas.clientWidth}px`;
+            canvas.style.height = csCanvas.style.height || `${csCanvas.clientHeight}px`;
+        }
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
         ctx.clearRect(0, 0, cw, ch);
@@ -652,17 +719,15 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
         try {
             const image = cornerstone.getImage(element);
             if (!image) return;
-            const vp = cornerstone.getViewport(element);
-            if (!vp) return;
 
-            const { width, height } = image;
-            const scale = vp.scale ?? 1;
-            const tx    = vp.translation?.x ?? 0;
-            const ty    = vp.translation?.y ?? 0;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const csAny = cornerstone as any;
             const coords = cornerstone.pageToPixel(element, mousePageXRef.current, mousePageYRef.current);
-            const cx = cw / 2 + tx + (coords.x - width  / 2) * scale;
-            const cy = ch / 2 + ty + (coords.y - height / 2) * scale;
-            const radius = Math.max(2, brushSizeRef.current * scale);
+            const c  = csAny.pixelToCanvas(element, coords);
+            const c2 = csAny.pixelToCanvas(element, { x: coords.x + brushSizeRef.current, y: coords.y });
+            const radius = Math.max(2, Math.hypot(c2.x - c.x, c2.y - c.y));
+            const cx = c.x;
+            const cy = c.y;
 
             const isErase = tool === 'Eraser';
             ctx.beginPath();
@@ -899,8 +964,10 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     // event handlers and timers never capture stale versions.
     extractLabelMapRef.current   = extractLabelMap;
     renderSegOverlayRef.current  = renderSegOverlay;
-    // Show HU preview while in Brush mode (shows which pixels match the HU range)
-    showHuPreviewRef.current     = (activeTool === 'Brush' && isCT);
+    // HU preview overlay is disabled. Smart Brush uses HU only as a paint filter
+    // inside the cursor circle — it never flood-fills the whole slice.
+    showHuPreviewRef.current     = false;
+    gatePreviewActiveRef.current = props.gatePreviewActive !== false;
     activeTissueRef.current      = activeMaskId;
     customHuMinRef.current       = brushHuMin;
     customHuMaxRef.current       = brushHuMax;
@@ -913,10 +980,12 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     // Rebuild LUT whenever masks or opacity changes
     segLutRef.current            = buildSegLut(extMasks, overlayOpacity);
 
-    // Re-render overlay when active mask or HU range changes
+    // Re-render overlay when active mask, HU range, or gate preview state changes
     useEffect(() => {
+        // Clear HU preview cache so the next render recomputes for the current slice
+        huPreviewCacheRef.current = null;
         renderSegOverlayRef.current?.();
-    }, [activeMaskId, brushHuMin, brushHuMax]);
+    }, [activeMaskId, brushHuMin, brushHuMax, props.gatePreviewActive]);
 
     // ── Fill-current-slice with HU threshold ─────────────────────────────────
     // One-shot: paints every pixel in the current 2D slice that falls within the
@@ -924,7 +993,7 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     // slice with the magic brush" without the user needing to drag.
     const fillCurrentSlice = useCallback(() => {
         const element = elementRef.current;
-        if (!element || !isReady || !isCT) return;
+        if (!element || !isReady) return;
         try {
             const image = cornerstone.getImage(element);
             if (!image) return;
@@ -935,11 +1004,8 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             const mask      = activeMask ?? TISSUE_TYPES[0];
             const huMin     = customHuMinRef.current;
             const huMax     = customHuMaxRef.current;
-            const segMod    = cornerstoneTools.getModule('segmentation');
-            try { segMod.setters.activeLabelmapIndex(element, 0); } catch { /* ignore */ }
-            const res       = segMod.getters.labelmap2D(element);
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const labelmapPd: Uint8Array | null = (res as any)?.labelmap2D?.pixelData ?? null;
+            // ensureLabelmapForSlice guarantees labelmap exists (force-creates if needed)
+            const labelmapPd = ensureLabelmapForSlice(currentIndexRef.current, image.width, image.height);
             if (!labelmapPd) return;
             for (let i = 0; i < image.width * image.height; i++) {
                 const hu = rawPx[i] * slope + intercept;
@@ -951,7 +1017,7 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             console.warn('fillCurrentSlice error:', err);
         }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [isReady, isCT]);
+    }, [isReady, ensureLabelmapForSlice]);
 
     // ── Fill entire stack with HU threshold ──────────────────────────────────
     // Reads DICOM files DIRECTLY via dicomParser — bypasses the Cornerstone image
@@ -978,13 +1044,22 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const ee   = cornerstone.getEnabledElement(element) as any;
         const uuid = ee?.uuid;
+        if (!uuid) return;
+
+        // Force-create series state if not initialized
+        if (!segMod.state.series) segMod.state.series = {};
+        if (!segMod.state.series[uuid]) {
+            segMod.state.series[uuid] = { activeLabelmapIndex: 0, labelmaps3D: [] };
+        }
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const ss   = segMod.state?.series?.[uuid] as any;
-        if (!ss) return;
+        const ss   = segMod.state.series[uuid] as any;
         const ai = ss.activeLabelmapIndex ?? 0;
+        if (!ss.labelmaps3D) ss.labelmaps3D = [];
+        if (!ss.labelmaps3D[ai]) {
+            ss.labelmaps3D[ai] = { labelmaps2D: [], metadata: [], activeSegmentIndex: 1, segmentsHidden: [], undo: [], redo: [] };
+        }
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const lm3D = ss.labelmaps3D?.[ai] as any;
-        if (!lm3D) return;
+        const lm3D = ss.labelmaps3D[ai] as any;
 
         for (let i = 0; i < files.length; i++) {
             try {
@@ -1177,6 +1252,60 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
         renderSegOverlayRef.current?.();
     }, [isReady, isCT]);
 
+    // Push a 3D labelmap (after lasso / sphere erase / undo) onto each 2D slice.
+    // Where the 3D voxel is 0, matching 2D pixels are cleared. Non-zero 3D voxels
+    // are left alone in 2D so higher-resolution brush strokes are preserved.
+    const apply3DLabelMap = useCallback((info: {
+        data: Uint8Array;
+        volW: number; volH: number; volD: number;
+        xyScale: number; zStep: number;
+        previous?: Uint8Array;
+    }) => {
+        const element = elementRef.current;
+        if (!element || !isReady) return;
+        const { data, volW, volH, volD, xyScale, zStep, previous } = info;
+        if (!data || volW <= 0 || volH <= 0 || volD <= 0) return;
+
+        let w = 0, h = 0;
+        try {
+            const image = cornerstone.getImage(element);
+            if (image) { w = image.width; h = image.height; }
+        } catch { /* ignore */ }
+        if (w === 0 || h === 0) {
+            w = volW * Math.max(1, xyScale);
+            h = volH * Math.max(1, xyScale);
+        }
+
+        const numSlices = totalImagesRef.current;
+        const sx = Math.max(1, xyScale);
+        const sz = Math.max(1, zStep);
+
+        for (let i = 0; i < numSlices; i++) {
+            const pd = ensureLabelmapForSlice(i, w, h);
+            if (!pd) continue;
+            const si = Math.min(Math.floor(i / sz), volD - 1);
+            const volBase = si * volW * volH;
+            for (let r = 0; r < h; r++) {
+                const vr = Math.min(Math.floor(r / sx), volH - 1);
+                const rowBase = volBase + vr * volW;
+                const dstRow = r * w;
+                for (let c = 0; c < w; c++) {
+                    const vc = Math.min(Math.floor(c / sx), volW - 1);
+                    const vi = rowBase + vc;
+                    const now = data[vi];
+                    if (previous) {
+                        if (previous[vi] === now) continue;
+                        pd[dstRow + c] = now;
+                    } else if (now === 0 && pd[dstRow + c] !== 0) {
+                        pd[dstRow + c] = 0;
+                    }
+                }
+            }
+        }
+        try { cornerstone.updateImage(element); } catch { /* ignore */ }
+        renderSegOverlayRef.current?.();
+    }, [isReady, ensureLabelmapForSlice]);
+
     // "전체 스택 채우기" — uses the currently active mask (from external props)
     const fillAllSlices = useCallback(async () => {
         if (!isReady || !isCT || fillProgress !== null) return;
@@ -1233,6 +1362,22 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
         let huMin          = -Infinity;
         let huMax          = Infinity;
         let doHuFilter     = false;
+        let lastSlicePush  = 0;
+
+        const pushSlice3D = (force = false) => {
+            if (!labelmapPd || imgWidth === 0) return;
+            const now = performance.now();
+            if (!force && now - lastSlicePush < 80) return;
+            lastSlicePush = now;
+            const copy = new Uint8Array(labelmapPd);
+            vtkRefreshSliceRef?.current?.({
+                sliceIdx:  currentIndexRef.current,
+                pixelData: copy,
+                width:     imgWidth,
+                height:    imgHeight,
+                numSlices: totalImagesRef.current,
+            });
+        };
 
         // During drag we NEVER call cornerstone.updateImage — it runs the full
         // render pipeline (clear → render image → fire events) and its internal
@@ -1255,7 +1400,7 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             if (!labelmapPd || imgWidth === 0) return;
             try {
                 const coords = cornerstone.pageToPixel(element, pageX, pageY);
-                const r  = Math.max(1, Math.round(brushSize));
+                const r  = Math.max(1, Math.round(brushSizeRef.current));
                 const r2 = r * r;
                 let changed = 0;
 
@@ -1278,7 +1423,10 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
                         }
                     }
                 }
-                if (changed > 0) scheduleRender();
+                if (changed > 0) {
+                    scheduleRender();
+                    pushSlice3D(false);
+                }
             } catch (err) {
                 console.warn('applyAt error:', err);
             }
@@ -1296,44 +1444,18 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
                 imgSlope     = image.slope     ?? 1;
                 imgIntercept = image.intercept ?? 0;
 
-                // Ensure labelmap exists for this slice before reading it
+                // Use ensureLabelmapForSlice to guarantee the labelmap exists
                 const segMod = cornerstoneTools.getModule('segmentation');
-                try { segMod.setters.activeLabelmapIndex(element, 0); } catch { /* ok */ }
-                // Sync active segment index
                 try { segMod.setters.activeSegmentIndex(element, activeMask?.segmentIndex ?? 1); } catch { /* ok */ }
 
-                const res    = segMod.getters.labelmap2D(element);
-                labelmapPd   = (res?.labelmap2D?.pixelData as Uint8Array) ?? null;
-
-                // If labelmap2D returns null, force-allocate one for this slice
-                if (!labelmapPd) {
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    const ee   = cornerstone.getEnabledElement(element) as any;
-                    const uuid = ee?.uuid;
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    const ss   = segMod.state?.series?.[uuid] as any;
-                    const ai   = ss?.activeLabelmapIndex ?? 0;
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                    const lm3D = ss?.labelmaps3D?.[ai] as any;
-                    const sliceIdx = currentIndexRef.current;
-                    if (lm3D) {
-                        if (!lm3D.labelmaps2D[sliceIdx]) {
-                            lm3D.labelmaps2D[sliceIdx] = {
-                                pixelData: new Uint8Array(imgWidth * imgHeight),
-                                segmentsOnLabelmap: [],
-                                isVisible: true,
-                                isInterpolated: false,
-                            };
-                        }
-                        labelmapPd = lm3D.labelmaps2D[sliceIdx].pixelData as Uint8Array;
-                    }
-                }
-                if (!labelmapPd) return; // still null — can't paint
+                labelmapPd = ensureLabelmapForSlice(currentIndexRef.current, imgWidth, imgHeight);
+                if (!labelmapPd) return; // element not ready — can't paint
 
                 segIdx = activeMask?.segmentIndex ?? 1;
 
-                // HU threshold filtering: only for CT + Brush (not eraser)
-                if (activeTool === 'Brush' && isCT) {
+                // Smart Brush: HU is a FILTER inside the cursor circle only.
+                // It never paints the rest of the slice.
+                if (isCT && gatePreviewActiveRef.current) {
                     doHuFilter = true;
                     rawPixels  = image.getPixelData();
                     huMin      = customHuMinRef.current;
@@ -1343,7 +1465,7 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
                     rawPixels  = null;
                 }
 
-                isBrushingRef.current = true; // suppress HU preview during stroke
+                isBrushingRef.current = true;
                 isDown = true;
                 applyAt(e.pageX, e.pageY);
             } catch (err) {
@@ -1356,22 +1478,16 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
         const onUp = () => {
             if (!isDown) return;
             isDown = false;
-            isBrushingRef.current = false; // allow HU preview to show again
+            isBrushingRef.current = false;
 
             // Cancel any pending overlay RAF
             if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
             needsRender = false;
 
-            // Final full 2D re-render (once, after stroke is complete).
+            // Final full 2D re-render + overlay update (once, after stroke ends).
             try { cornerstone.updateImage(element); } catch { /* ignore */ }
-
-            // Debounced auto-3D push: updates the 3D mask volume overlay 500 ms after
-            // the last stroke so the 3D view stays in sync without per-stroke overhead.
-            if (auto3DTimerRef.current) clearTimeout(auto3DTimerRef.current);
-            auto3DTimerRef.current = setTimeout(() => {
-                auto3DTimerRef.current = null;
-                extractLabelMapRef.current?.();
-            }, 500);
+            renderSegOverlayRef.current?.();
+            pushSlice3D(true);
 
             // Clear per-stroke cache
             labelmapPd = null; rawPixels = null;
@@ -1396,8 +1512,9 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     // Sync external brushMode → internal activeTool.
     // brushModeTick increments each time MaskPanel Draw/Erase is clicked,
     // so this effect fires even when the mode value stays the same.
+    // Skip tick=0 to keep W/L as the default tool on mount.
     useEffect(() => {
-        if (brushModeTick === undefined || brushModeTick === 0) return; // skip initial mount
+        if (brushModeTick === undefined || brushModeTick === 0) return;
         if (externalBrushMode === 'erase') {
             setActiveTool('Eraser');
         } else {
@@ -1414,8 +1531,9 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             fillAllSlices,
             sendTo3D: () => { extractLabelMapRef.current?.(); },
             applyOrgansSegmentation,
+            apply3DLabelMap,
         };
-    }, [fillCurrentSlice, fillAllSlices, applyOrgansSegmentation, imperativeRef]);
+    }, [fillCurrentSlice, fillAllSlices, applyOrgansSegmentation, apply3DLabelMap, imperativeRef]);
 
     // Propagate fill progress to parent
     useEffect(() => {
@@ -1429,78 +1547,84 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     return (
         <div className="w-full h-full flex flex-col bg-black relative">
 
-            {/* ── Compact Toolbar ──────────────────────────────────────────── */}
-            <div className="h-9 bg-[#1a1a1a] border-b border-[#2a2a2a] flex items-center px-2 gap-1 z-20 shrink-0">
+            {/* ── Compact Toolbar (OHIF style) ─────────────────────────────── */}
+            <div className="h-9 bg-[#16162a] border-b border-[#2d2d50] flex items-center px-2 gap-1 z-20 shrink-0">
 
-                {/* View tools */}
-                <TbBtn active={activeTool === 'Wwwc'} onClick={() => setActiveTool('Wwwc')} title="Window/Level">W/L</TbBtn>
-                <TbBtn active={activeTool === 'Brush'} onClick={() => setActiveTool('Brush')} title="Brush"
-                    style={activeTool === 'Brush' ? { backgroundColor: activeMask?.colorCss ?? '#4a9eff' } : {}}>
-                    ✏️
-                </TbBtn>
-                <TbBtn active={activeTool === 'Eraser'} onClick={() => setActiveTool('Eraser')} title="Eraser" danger>
-                    ⌫
-                </TbBtn>
-                <TbBtn active={activeTool === 'Length'} onClick={() => setActiveTool('Length')} title="Length">⟷</TbBtn>
-
-                <div className="w-px h-5 bg-[#333] mx-0.5" />
-
-                {/* Brush size */}
-                {(activeTool === 'Brush' || activeTool === 'Eraser') && (
-                    <div className="flex items-center gap-1 shrink-0">
-                        <span className="text-[10px] text-slate-500">Size</span>
-                        <input type="range" min="1" max="60" value={brushSize}
-                            onChange={e => setBrushSize(Number(e.target.value))}
-                            className="w-14 h-1 appearance-none rounded accent-sky-500 bg-[#333] cursor-pointer" />
-                        <span className="text-[10px] text-slate-400 w-4 tabular-nums">{brushSize}</span>
-                    </div>
-                )}
-
-                <div className="w-px h-5 bg-[#333] mx-0.5" />
-
-                {/* Overlay opacity */}
-                <div className="flex items-center gap-1 shrink-0" title="세그멘테이션 오버레이 투명도">
-                    <span className="text-[9px] text-slate-500">투명도</span>
-                    <input type="range" min="10" max="100" step="5" value={Math.round(overlayOpacity * 100)}
-                        onChange={e => { const v = Number(e.target.value) / 100; setOverlayOpacity(v); overlayOpacityRef.current = v; renderSegOverlayRef.current?.(); }}
-                        className="w-12 h-1 appearance-none rounded accent-sky-500 bg-[#333] cursor-pointer" />
-                    <span className="text-[9px] text-slate-400 w-5 tabular-nums">{Math.round(overlayOpacity * 100)}%</span>
-                </div>
-
-                <div className="w-px h-5 bg-[#333] mx-0.5" />
-
-                {/* Zoom */}
-                <TbBtn onClick={() => zoomViewport(1/1.25)} title="Zoom out">−</TbBtn>
-                <TbBtn onClick={resetView} title="Reset view">⊡</TbBtn>
-                <TbBtn onClick={() => zoomViewport(1.25)} title="Zoom in">+</TbBtn>
-
-                {/* Slice nav */}
+                {/* Previous / Next slice */}
                 {totalImages > 0 && (
                     <>
-                        <div className="w-px h-5 bg-[#333] mx-0.5" />
-                        <TbBtn onClick={() => navigateSlice(-1)} disabled={currentImageIndex === 0} title="Prev slice">◀</TbBtn>
-                        <span className="text-[10px] font-mono text-sky-400 min-w-[3rem] text-center">
-                            {(currentImageIndex ?? 0) + 1}/{totalImages}
+                        <TbBtn onClick={() => navigateSlice(-1)} disabled={currentImageIndex === 0} title="Previous (↑)">◀</TbBtn>
+                        <TbBtn onClick={() => navigateSlice(1)} disabled={currentImageIndex === totalImages - 1} title="Next (↓)">▶</TbBtn>
+                        <span className="text-[10px] font-mono text-sky-400 min-w-[3.5rem] text-center tabular-nums">
+                            {(currentImageIndex ?? 0) + 1} / {totalImages}
                         </span>
-                        <TbBtn onClick={() => navigateSlice(1)} disabled={currentImageIndex === totalImages - 1} title="Next slice">▶</TbBtn>
+                        <div className="w-px h-5 bg-[#2d2d50] mx-0.5" />
                     </>
                 )}
 
-                <div className="flex-1" />
+                {/* View tools */}
+                <TbBtn active={activeTool === 'Wwwc'} onClick={() => setActiveTool('Wwwc')} title="Levels (W/L)">W/L</TbBtn>
+                <TbBtn onClick={() => zoomViewport(1.25)} title="Zoom in (+)">+</TbBtn>
+                <TbBtn onClick={() => zoomViewport(1/1.25)} title="Zoom out (−)">−</TbBtn>
+                <TbBtn onClick={resetView} title="Reset view">⊡</TbBtn>
 
-                {/* Update 3D */}
-                <button onClick={extractLabelMap}
-                    className="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 text-white rounded text-[10px] font-semibold transition-colors shrink-0">
-                    ↑ 3D
-                </button>
+                <div className="w-px h-5 bg-[#2d2d50] mx-0.5" />
 
                 {/* W/L presets */}
                 {(['Brain','Lung','Bone','Soft'] as const).map(p => (
                     <button key={p} onClick={() => applyPreset(p === 'Soft' ? 'Soft Tissue' : p)}
-                        className="text-[10px] bg-[#222] hover:bg-[#2a2a2a] text-slate-400 px-1.5 py-0.5 rounded transition-colors">
+                        className="text-[10px] bg-[#1e1e38] hover:bg-[#2a2a50] text-slate-400 hover:text-slate-200 px-1.5 py-0.5 rounded transition-colors">
                         {p}
                     </button>
                 ))}
+
+                <div className="w-px h-5 bg-[#2d2d50] mx-0.5" />
+
+                {/* Segmentation tools */}
+                <TbBtn active={activeTool === 'Brush'} onClick={() => setActiveTool('Brush')} title="Draw brush (paint HU-matched regions)"
+                    style={activeTool === 'Brush' ? { backgroundColor: activeMask?.colorCss ?? '#0ea5e9', color: '#000' } : {}}>
+                    ✏ Draw
+                </TbBtn>
+                <TbBtn active={activeTool === 'Eraser'} onClick={() => setActiveTool('Eraser')} title="Eraser" danger>
+                    ⌫ Erase
+                </TbBtn>
+
+                {/* Brush size (visible when brush active) */}
+                {(activeTool === 'Brush' || activeTool === 'Eraser') && (
+                    <>
+                        <div className="w-px h-5 bg-[#2d2d50] mx-0.5" />
+                        <span className="text-[10px] text-slate-500 shrink-0">Size</span>
+                        <input type="range" min="1" max="80" value={brushSize}
+                            onChange={e => setBrushSize(Number(e.target.value))}
+                            className="w-16 h-1.5 appearance-none rounded accent-sky-500 bg-[#2d2d50] cursor-pointer" />
+                        <span className="text-[10px] text-slate-400 w-5 tabular-nums">{brushSize}</span>
+                    </>
+                )}
+
+                <div className="w-px h-5 bg-[#2d2d50] mx-0.5" />
+
+                {/* Overlay opacity */}
+                <span className="text-[9px] text-slate-500 shrink-0">Opacity</span>
+                <input type="range" min="10" max="100" step="5" value={Math.round(overlayOpacity * 100)}
+                    onChange={e => { const v = Number(e.target.value) / 100; setOverlayOpacity(v); overlayOpacityRef.current = v; renderSegOverlayRef.current?.(); }}
+                    className="w-12 h-1.5 appearance-none rounded accent-sky-500 bg-[#2d2d50] cursor-pointer" />
+                <span className="text-[9px] text-slate-400 w-5 tabular-nums">{Math.round(overlayOpacity * 100)}%</span>
+
+                <div className="flex-1" />
+
+                {/* Active tool indicator */}
+                {(activeTool === 'Brush' || activeTool === 'Eraser') && activeMask && (
+                    <div className="flex items-center gap-1 px-2 py-0.5 rounded bg-[#1e1e38] border border-[#3a3a60] text-[10px]">
+                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: activeMask.colorCss }} />
+                        <span className="text-slate-300">{activeMask.name}</span>
+                    </div>
+                )}
+
+                {/* Update 3D */}
+                <button onClick={extractLabelMap}
+                    className="px-2.5 py-1 bg-emerald-700 hover:bg-emerald-600 text-white rounded text-[10px] font-semibold transition-colors shrink-0">
+                    ↑ 3D
+                </button>
             </div>
 
             {/* ── Cornerstone viewport + segmentation colour overlay ───────── */}

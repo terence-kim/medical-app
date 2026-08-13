@@ -23,11 +23,20 @@ declare module 'cornerstone-math' {
 }
 
 declare module 'dicom-parser' {
+    interface DicomElement { dataOffset: number; length: number; }
+    interface DataSet {
+        string: (tag: string) => string | undefined;
+        uint16: (tag: string) => number | undefined;
+        elements: Record<string, DicomElement>;
+    }
     const dicomParser: {
-        parseDicom: (byteArray: Uint8Array) => {
-            string: (tag: string) => string | undefined;
-            uint16: (tag: string) => number | undefined;
-        };
+        parseDicom: (byteArray: Uint8Array) => DataSet;
     };
     export default dicomParser;
+}
+
+declare module '@kitware/vtk.js/Filters/General/ImageMarchingCubes' {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ImageMarchingCubes: any;
+    export default ImageMarchingCubes;
 }

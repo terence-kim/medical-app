@@ -12,6 +12,10 @@ import vtkImageData from '@kitware/vtk.js/Common/DataModel/ImageData';
 import vtkDataArray from '@kitware/vtk.js/Common/Core/DataArray';
 import vtkImageMarchingCubes from '@kitware/vtk.js/Filters/General/ImageMarchingCubes';
 import vtkPlane from '@kitware/vtk.js/Common/DataModel/Plane';
+import vtkInteractorStyleManipulator from '@kitware/vtk.js/Interaction/Style/InteractorStyleManipulator';
+import vtkMouseCameraTrackballRotateManipulator from '@kitware/vtk.js/Interaction/Manipulators/MouseCameraTrackballRotateManipulator';
+import vtkMouseCameraTrackballPanManipulator from '@kitware/vtk.js/Interaction/Manipulators/MouseCameraTrackballPanManipulator';
+import vtkMouseCameraTrackballZoomManipulator from '@kitware/vtk.js/Interaction/Manipulators/MouseCameraTrackballZoomManipulator';
 import type { Vector3 } from '@kitware/vtk.js/types';
 import type { mat3 } from 'gl-matrix';
 import { createVolumeFromFiles, type VolumeResult } from '../utils/volumeLoader';
@@ -20,10 +24,20 @@ import type { Mask } from '../types/mask';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type VtkActorInstance = any;
 
+export interface SlicePaintInfo {
+    sliceIdx:  number;
+    pixelData: Uint8Array;
+    width:     number;
+    height:    number;
+    numSlices: number;
+}
+
 interface VTKViewerProps {
     files?: File[] | null;
     /** Named mask list from App.tsx — used for surface mesh colors and segment indices */
     masks?: Mask[];
+    /** Layers checked in MaskPanel — Generate 3D uses only these */
+    selectedMaskIds?: string[];
     onError?: (message: string) => void;
     /** Called when generating status changes */
     onGeneratingChange?: (v: boolean) => void;
@@ -31,8 +45,17 @@ interface VTKViewerProps {
     generateRef?: React.MutableRefObject<(() => void) | null>;
     /** Parent populates this ref so CornerstoneViewer can push labelmap directly (no state copy) */
     refreshLabelMapRef?: React.MutableRefObject<((data: Uint8Array) => void) | null>;
+    /** Live per-slice paint from 2D brush — updates 3D without copying the full volume */
+    refreshSliceRef?: React.MutableRefObject<((info: SlicePaintInfo) => void) | null>;
     /** Called after HU-based 3D generation so CornerstoneViewer can color matching 2D slices */
     onSegmentationGenerated?: (organs: { id: string; huMin: number; huMax: number }[]) => void;
+    /** Called after 3D lasso/sphere erase/undo so 2D slices stay in sync */
+    on3DLabelMapEdited?: (info: {
+        data: Uint8Array;
+        volW: number; volH: number; volD: number;
+        xyScale: number; zStep: number;
+        previous?: Uint8Array;
+    }) => void;
 }
 
 type FullScreenRenderer = ReturnType<typeof vtkFullScreenRenderWindow.newInstance>;
@@ -45,19 +68,22 @@ interface VtkContext {
     maskVolume: VtkVolumeActor | null;
 }
 
-function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef, refreshLabelMapRef, onSegmentationGenerated }: VTKViewerProps) {
+function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGeneratingChange, generateRef, refreshLabelMapRef, refreshSliceRef, onSegmentationGenerated, on3DLabelMapEdited }: VTKViewerProps) {
     const vtkContainerRef = useRef<HTMLDivElement>(null);
     const context = useRef<VtkContext | null>(null);
     const [isLoading,      setIsLoading]      = useState(false);
     const [loadProgress,   setLoadProgress]   = useState(0);
     const [isGenerated,    setIsGenerated]    = useState(false);
     const [hasMeshes,      setHasMeshes]      = useState(false);
+    const [generatedOrganIds, setGeneratedOrganIds] = useState<string[]>([]);
 
     // Refs for surface mesh actors — cleaned up before each Generate Model run
     const meshActorsRef = useRef<VtkActorInstance[]>([]);
     // Keep a ref to masks for use in generateSurfaceMeshes callback
     const masksRef      = useRef<Mask[]>(masks);
     masksRef.current    = masks;
+    const selectedMaskIdsRef = useRef<string[]>(selectedMaskIds);
+    selectedMaskIdsRef.current = selectedMaskIds;
 
     // ── Per-organ HU segmentation state ──────────────────────────────────────
     // activeOrgans: which organs are toggled ON for 3D generation/visualization
@@ -79,6 +105,10 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
             segmentIndex: m.segmentIndex,
         };
     }), [masks, organHU]);
+    const organDefsRef = useRef(organDefs);
+    organDefsRef.current = organDefs;
+    const activeOrgansRef = useRef(activeOrgans);
+    activeOrgansRef.current = activeOrgans;
 
     const toggleOrgan = (id: string) => {
         setActiveOrgans(prev => {
@@ -136,11 +166,36 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
         zStep: number;
     }
     const [volumeMetadata, setVolumeMetadata] = useState<VolumeMetadata | null>(null);
+    const volumeMetadataRef = useRef<VolumeMetadata | null>(null);
+    volumeMetadataRef.current = volumeMetadata;
+    const [hasLiveMask, setHasLiveMask] = useState(false);
+    const on3DEditedRef = useRef(on3DLabelMapEdited);
+    on3DEditedRef.current = on3DLabelMapEdited;
+
+    const syncLabelMapTo2D = (previous?: Uint8Array) => {
+        const data = localLabelMapRef.current;
+        if (!data || !on3DEditedRef.current) return;
+        const meta = volumeMetadataRef.current;
+        let volW = 0, volH = 0, volD = 0, xyScale = 1, zStep = 1;
+        if (meta) {
+            [volW, volH, volD] = meta.dimensions as unknown as number[];
+            xyScale = meta.xyScale;
+            zStep   = meta.zStep;
+        } else if (maskImageDataRef.current) {
+            const d = maskImageDataRef.current.getDimensions() as number[];
+            volW = d[0]; volH = d[1]; volD = d[2];
+        } else return;
+        if (volW <= 0) return;
+        on3DEditedRef.current({ data, volW, volH, volD, xyScale, zStep, previous });
+    };
 
     // ── 3D Erase + Lasso ─────────────────────────────────────────────────────
     // A local mutable copy of the labelmap is kept so the user can erase
     // voxels directly in the 3D view without touching the 2D cornerstone state.
-    const localLabelMapRef  = useRef<Uint8Array | null>(null);
+    const localLabelMapRef      = useRef<Uint8Array | null>(null);
+    // Labelmap pushed by CornerstoneViewer before volumeMetadata is available.
+    // Applied automatically once Generate 3D sets volumeMetadata.
+    const pendingLabelMapRef    = useRef<Uint8Array | null>(null);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const maskScalarsRef    = useRef<any>(null);   // vtkDataArray reference
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -148,6 +203,46 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
     const [is3DEraseMode,  setIs3DEraseMode]  = useState(false);
     const [eraseRadius3D,  setEraseRadius3D]  = useState(5); // voxels
     const isErasingRef      = useRef(false);
+    const didSnapshotStrokeRef = useRef(false);
+
+    // Undo stack for 3D labelmap edits (lasso / sphere erase)
+    const undoStackRef = useRef<Uint8Array[]>([]);
+    const [undoCount, setUndoCount] = useState(0);
+    const UNDO_LIMIT = 8;
+
+    const pushUndoSnapshot = () => {
+        const data = localLabelMapRef.current;
+        if (!data) return;
+        undoStackRef.current.push(new Uint8Array(data));
+        if (undoStackRef.current.length > UNDO_LIMIT) undoStackRef.current.shift();
+        setUndoCount(undoStackRef.current.length);
+    };
+
+    const undo3DEdit = () => {
+        const prev = undoStackRef.current.pop();
+        if (!prev || !localLabelMapRef.current) return;
+        const edited = new Uint8Array(localLabelMapRef.current);
+        localLabelMapRef.current.set(prev);
+        try {
+            maskScalarsRef.current?.modified();
+            maskImageDataRef.current?.getPointData()?.modified();
+            maskImageDataRef.current?.modified();
+            context.current?.renderWindow?.render();
+        } catch { /* ignore */ }
+        setUndoCount(undoStackRef.current.length);
+        syncLabelMapTo2D(edited);
+    };
+
+    const setTool3D = (tool: 'move' | 'sphere' | 'lasso') => {
+        setIs3DEraseMode(tool === 'sphere');
+        setLassoMode(tool === 'lasso');
+        lassoActiveRef.current = false;
+        isErasingRef.current = false;
+        didSnapshotStrokeRef.current = false;
+        lassoPointsRef.current = [];
+        const c = lassoCanvasRef.current;
+        if (c) c.getContext('2d')?.clearRect(0, 0, c.width, c.height);
+    };
 
     // Lasso erase
     const [lassoMode,       setLassoMode]       = useState(false);
@@ -169,6 +264,39 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
         const renderer = fullScreenRenderer.getRenderer();
         const renderWindow = fullScreenRenderer.getRenderWindow();
 
+        // TrackballCamera never subscribes to MiddleButtonPress, so assigning
+        // handleMiddleButtonPress later is ignored. Use explicit manipulators:
+        // left = rotate, middle = pan, right = zoom, wheel = zoom.
+        try {
+            const interactor = renderWindow.getInteractor();
+            const style = vtkInteractorStyleManipulator.newInstance();
+
+            const rotate = vtkMouseCameraTrackballRotateManipulator.newInstance({ button: 1 });
+            const panMiddle = vtkMouseCameraTrackballPanManipulator.newInstance({ button: 2 });
+            const panShiftLeft = vtkMouseCameraTrackballPanManipulator.newInstance({ button: 1, shift: true });
+            const zoomRight = vtkMouseCameraTrackballZoomManipulator.newInstance({ button: 3 });
+            const zoomWheel = vtkMouseCameraTrackballZoomManipulator.newInstance({
+                scrollEnabled: true,
+                dragEnabled: false,
+            });
+
+            style.addMouseManipulator(rotate);
+            style.addMouseManipulator(panMiddle);
+            style.addMouseManipulator(panShiftLeft);
+            style.addMouseManipulator(zoomRight);
+            style.addMouseManipulator(zoomWheel);
+            interactor.setInteractorStyle(style);
+        } catch { /* manipulator setup is best-effort */ }
+
+        // Stop Windows/browser autoscroll so middle-drag reaches VTK.
+        const container = vtkContainerRef.current;
+        const blockMiddleAutoscroll = (e: MouseEvent) => {
+            if (e.button === 1) e.preventDefault();
+        };
+        container.addEventListener('mousedown', blockMiddleAutoscroll, { capture: true });
+        container.addEventListener('auxclick', blockMiddleAutoscroll);
+        container.addEventListener('pointerdown', blockMiddleAutoscroll, { capture: true });
+
         context.current = {
             fullScreenRenderer,
             renderer,
@@ -178,6 +306,9 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
         };
 
         return () => {
+            container.removeEventListener('mousedown', blockMiddleAutoscroll, { capture: true } as EventListenerOptions);
+            container.removeEventListener('auxclick', blockMiddleAutoscroll);
+            container.removeEventListener('pointerdown', blockMiddleAutoscroll, { capture: true } as EventListenerOptions);
             if (context.current) {
                 const { fullScreenRenderer } = context.current;
                 const renderWindow = fullScreenRenderer.getRenderWindow();
@@ -192,6 +323,28 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
         };
     }, []);
 
+    // Esc → Move, Ctrl+Z → Undo (3D erase / lasso)
+    useEffect(() => {
+        const onKey = (e: KeyboardEvent) => {
+            const tag = (e.target as HTMLElement)?.tagName;
+            if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+            if (e.key === 'Escape') {
+                setIs3DEraseMode(false);
+                setLassoMode(false);
+                lassoActiveRef.current = false;
+                isErasingRef.current = false;
+                lassoPointsRef.current = [];
+                const c = lassoCanvasRef.current;
+                if (c) c.getContext('2d')?.clearRect(0, 0, c.width, c.height);
+            } else if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
+                e.preventDefault();
+                undo3DEdit();
+            }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, []);
+
     // Toggle CT volume visibility based on segmentation-only mode
     useEffect(() => {
         if (!context.current?.volume || !isGenerated) return;
@@ -203,9 +356,16 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
     useEffect(() => {
         setIsGenerated(false);
         setVolumeMetadata(null);
+        volumeMetadataRef.current = null;
         setSliceMode(false);
         setSliceIndex(0);
         setSegOnlyMode(false);
+        undoStackRef.current = [];
+        setUndoCount(0);
+        setIs3DEraseMode(false);
+        setLassoMode(false);
+        setHasMeshes(false);
+        setGeneratedOrganIds([]);
 
         // Clear existing volumes if any
         if (context.current) {
@@ -556,6 +716,7 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
     // Project all non-zero labelmap voxels to screen and erase those inside the polygon.
     const applyLassoErase = async (poly: {x:number;y:number}[]) => {
         if (poly.length < 3 || !localLabelMapRef.current || !volumeMetadata) return;
+        pushUndoSnapshot();
         setLassoProcessing(true);
         await new Promise(r => setTimeout(r, 10)); // allow UI update
 
@@ -594,6 +755,7 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
                 maskImageDataRef.current?.modified();
                 context.current?.renderWindow?.render();
             } catch { /* ignore */ }
+            syncLabelMapTo2D(undoStackRef.current[undoStackRef.current.length - 1]);
         }
         clearLassoCanvas();
         setLassoProcessing(false);
@@ -629,6 +791,10 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
     const handleEraseMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
         e.preventDefault();
         isErasingRef.current = true;
+        if (!didSnapshotStrokeRef.current) {
+            pushUndoSnapshot();
+            didSnapshotStrokeRef.current = true;
+        }
         const rect = e.currentTarget.getBoundingClientRect();
         const ray = getScreenRay(e.clientX - rect.left, e.clientY - rect.top);
         if (!ray) return;
@@ -643,7 +809,12 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
         const hit = findRayHit(ray.origin, ray.dir);
         if (hit) eraseSphere(hit);
     };
-    const handleEraseMouseUp = () => { isErasingRef.current = false; };
+    const handleEraseMouseUp = () => {
+        isErasingRef.current = false;
+        didSnapshotStrokeRef.current = false;
+        const previous = undoStackRef.current[undoStackRef.current.length - 1];
+        if (previous) syncLabelMapTo2D(previous);
+    };
 
     const generate3DVolume = async () => {
         if (!context.current || !files || files.length === 0) return;
@@ -661,13 +832,15 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
             const { imageData, xyScale, origCols, origRows, zStep } = result as VolumeResult;
 
             const dimensions = imageData.getDimensions();
-            setVolumeMetadata({
+            const meta: VolumeMetadata = {
                 origin:    imageData.getOrigin(),
                 spacing:   imageData.getSpacing(),
                 dimensions,
                 direction: imageData.getDirection(),
                 xyScale, origCols, origRows, zStep,
-            });
+            };
+            volumeMetadataRef.current = meta;
+            setVolumeMetadata(meta);
             setSliceMode(false);
             setSliceIndex(Math.floor(dimensions[2] / 2));
 
@@ -729,20 +902,23 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
     // Priority: HU-based auto-seg from CT scalars (when activeOrgans selected)
     //           → manual labelmap painted in 2D (fallback)
     const generateSurfaceMeshes = async () => {
-        if (!volumeMetadata || !context.current) {
+        const meta = volumeMetadataRef.current;
+        if (!meta || !context.current) {
             onError?.('먼저 CT 볼륨을 생성하세요 (Generate 3D Volume).');
             return;
         }
 
-        const { origin, spacing, dimensions, direction } = volumeMetadata;
+        const { origin, spacing, dimensions, direction } = meta;
         const [W, H, D] = dimensions as [number, number, number];
         const totalVox   = W * H * D;
 
-        // Which masks to generate: activeOrgans (HU-based) takes priority over painted labelmap
-        const huBasedOrgs = organDefs.filter(o => activeOrgans.has(o.id));
+        // Generate only layers checked in the right-side MaskPanel.
+        const checked = new Set(selectedMaskIdsRef.current);
+        const huBasedOrgs = organDefsRef.current.filter(o => checked.has(o.id));
         const labelMap     = localLabelMapRef.current;
         const paintedMasks = labelMap
             ? masksRef.current.filter(m => {
+                if (checked.size > 0 && !checked.has(m.id)) return false;
                 const seg = m.segmentIndex;
                 for (let i = 0; i < labelMap.length; i++) {
                     if (labelMap[i] === seg) return true;
@@ -752,7 +928,7 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
             : [];
 
         if (huBasedOrgs.length === 0 && paintedMasks.length === 0) {
-            onError?.('부위를 선택하거나 2D에서 브러쉬로 색칠한 후 Generate Model을 클릭하세요.');
+            onError?.('레이어 패널에서 3D로 뽑을 레이어를 체크한 뒤 Generate를 누르세요.');
             return;
         }
 
@@ -769,7 +945,8 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
             maskImg.setDimensions([W, H, D]);
             maskImg.setSpacing(spacing as [number, number, number]);
             maskImg.setOrigin(origin as [number, number, number]);
-            maskImg.setDirection(direction as unknown as number[]);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            maskImg.setDirection(direction as any);
             const arr = vtkDataArray.newInstance({ name: 'scalars', values: binary, numberOfComponents: 1 });
             maskImg.getPointData().setScalars(arr);
 
@@ -809,14 +986,17 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
                 worker.onerror = () => {
                     // Fallback: generate on main thread if Worker fails
                     worker.terminate();
-                    const fallback = huBasedOrgs.map(org => {
-                        const binary = new Uint8Array(totalVox);
-                        for (let i = 0; i < totalVox; i++) {
-                            binary[i] = ct[i] >= org.huMin && ct[i] <= org.huMax ? 1 : 0;
+                    const binaries = huBasedOrgs.map(() => new Uint8Array(totalVox));
+                    for (let i = 0; i < totalVox; i++) {
+                        const hu = ct[i];
+                        for (let o = 0; o < huBasedOrgs.length; o++) {
+                            if (hu >= huBasedOrgs[o].huMin && hu <= huBasedOrgs[o].huMax) {
+                                binaries[o][i] = 1;
+                                break;
+                            }
                         }
-                        return { id: org.id, binary };
-                    });
-                    resolve(fallback);
+                    }
+                    resolve(huBasedOrgs.map((org, o) => ({ id: org.id, binary: binaries[o] })));
                 };
                 // Copy (not transfer) ct scalars — we need to keep ctScalarsRef intact
                 worker.postMessage({
@@ -829,6 +1009,11 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
             for (const { id, binary } of binaryResults) {
                 const org = huBasedOrgs.find(o => o.id === id);
                 if (!org) continue;
+                let hasVoxels = false;
+                for (let i = 0; i < binary.length; i++) {
+                    if (binary[i]) { hasVoxels = true; break; }
+                }
+                if (!hasVoxels) continue;
                 const [r, g, b] = org.color;
                 await buildMesh(binary, r, g, b);
             }
@@ -854,6 +1039,7 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
         renderer.resetCamera();
         renderWindow.render();
         setHasMeshes(true);
+        setGeneratedOrganIds(huBasedOrgs.map(o => o.id));
         onGeneratingChange?.(false);
 
         // Notify CornerstoneViewer to mirror the segmentation on the 2D slices
@@ -865,17 +1051,22 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
     };
 
     // Expose generate to parent via generateRef
+    // One click: if volume not yet loaded → load volume THEN immediately generate meshes.
+    // If already loaded → regenerate meshes only.
+    const generateSurfaceMeshesRef = useRef(generateSurfaceMeshes);
+    generateSurfaceMeshesRef.current = generateSurfaceMeshes;
+    const generate3DVolumeRef = useRef(generate3DVolume);
+    generate3DVolumeRef.current = generate3DVolume;
+
     useEffect(() => {
         if (!generateRef) return;
-        generateRef.current = () => {
-            if (isGenerated) {
-                generateSurfaceMeshes();
-            } else {
-                generate3DVolume();
+        generateRef.current = async () => {
+            if (!volumeMetadataRef.current) {
+                await generate3DVolumeRef.current();
             }
+            await generateSurfaceMeshesRef.current();
         };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [isGenerated, volumeMetadata]);
+    }, [generateRef]);
 
     // ── Mask colour transfer function (built once, reused) ───────────────────
     const maskCtfunRef = useRef<ReturnType<typeof vtkColorTransferFunction.newInstance> | null>(null);
@@ -913,7 +1104,11 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
 
     // ── Apply labelmap data (called directly by CornerstoneViewer — no React state copy) ─
     const applyLabelMapData = useCallback((labelMapData: Uint8Array) => {
-        if (!context.current || !volumeMetadata) return;
+        if (!context.current || !volumeMetadata) {
+            // Store for deferred application once Generate 3D loads volumeMetadata
+            pendingLabelMapRef.current = labelMapData;
+            return;
+        }
         const { renderer, renderWindow } = context.current;
 
         // ── Downsample labelmap to match the CT volume resolution ─────────────
@@ -949,6 +1144,10 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
             (maskScalarsRef.current as any).setData(maskedData, 1);
             maskScalarsRef.current.modified();
             maskImageDataRef.current.modified();
+            meshActorsRef.current.forEach(a => {
+                try { a.setVisibility(false); } catch { /* ignore */ }
+            });
+            setHasLiveMask(true);
             renderWindow.render();
             return;
         }
@@ -958,7 +1157,8 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
         maskImgData.setDimensions([outCols, outRows, outSlices]);
         maskImgData.setSpacing(volumeMetadata.spacing as [number, number, number]);
         maskImgData.setOrigin(volumeMetadata.origin as [number, number, number]);
-        maskImgData.setDirection(volumeMetadata.direction as unknown as number[]);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        maskImgData.setDirection(volumeMetadata.direction as any);
 
         const dataArray = vtkDataArray.newInstance({
             name: 'Scalars', values: maskedData, numberOfComponents: 1,
@@ -988,6 +1188,13 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
         renderer.addVolume(maskActor);
         context.current.maskVolume = maskActor;
         setSegOnlyMode(true);
+        setHasLiveMask(true);
+
+        // Generated marching-cubes meshes are a snapshot. Hide them so the live
+        // editable mask volume (updated from 2D brush/erase) is what the user sees.
+        meshActorsRef.current.forEach(a => {
+            try { a.setVisibility(false); } catch { /* ignore */ }
+        });
 
         if (sliceModeRef.current) {
             applyClipPlanesToMapper(maskMapper, true);
@@ -997,12 +1204,155 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [volumeMetadata]);
 
+    const ensureMaskActor = useCallback((
+        values: Uint8Array,
+        dims: [number, number, number],
+        spacing: [number, number, number],
+        origin: [number, number, number],
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        direction?: any,
+    ) => {
+        if (!context.current) return;
+        const { renderer, renderWindow } = context.current;
+
+        if (maskImageDataRef.current && maskScalarsRef.current && context.current.maskVolume) {
+            const cur = maskImageDataRef.current.getDimensions() as number[];
+            if (cur[0] === dims[0] && cur[1] === dims[1] && cur[2] === dims[2]) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                (maskScalarsRef.current as any).setData(values, 1);
+                maskScalarsRef.current.modified();
+                maskImageDataRef.current.modified();
+                meshActorsRef.current.forEach(a => {
+                    try { a.setVisibility(false); } catch { /* ignore */ }
+                });
+                setHasLiveMask(true);
+                renderWindow.render();
+                return;
+            }
+            renderer.removeVolume(context.current.maskVolume);
+            try { context.current.maskVolume.delete(); } catch { /* ignore */ }
+            context.current.maskVolume = null;
+        }
+
+        const maskImgData = vtkImageData.newInstance();
+        maskImgData.setDimensions(dims);
+        maskImgData.setSpacing(spacing);
+        maskImgData.setOrigin(origin);
+        if (direction) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            maskImgData.setDirection(direction as any);
+        }
+
+        const dataArray = vtkDataArray.newInstance({
+            name: 'Scalars', values, numberOfComponents: 1,
+        });
+        maskImgData.getPointData().setScalars(dataArray);
+        maskScalarsRef.current   = dataArray;
+        maskImageDataRef.current = maskImgData;
+
+        const maskActor  = vtkVolume.newInstance();
+        const maskMapper = vtkVolumeMapper.newInstance();
+        maskMapper.setInputData(maskImgData);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (maskMapper as any).setSampleDistance?.(Math.min(...spacing) * 2 || 2);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (maskMapper as any).setMaximumSamplesPerRay?.(4000);
+        maskActor.setMapper(maskMapper);
+
+        const { ctfun, ofun } = buildMaskTransferFunctions();
+        maskActor.getProperty().setRGBTransferFunction(0, ctfun);
+        maskActor.getProperty().setScalarOpacity(0, ofun);
+        maskActor.getProperty().setInterpolationTypeToNearest();
+        maskActor.getProperty().setShade(true);
+        maskActor.getProperty().setAmbient(0.3);
+        maskActor.getProperty().setDiffuse(0.7);
+        maskActor.getProperty().setSpecular(0.2);
+
+        renderer.addVolume(maskActor);
+        context.current.maskVolume = maskActor;
+        setSegOnlyMode(true);
+        setHasLiveMask(true);
+
+        if (!context.current.volume) {
+            renderer.resetCamera();
+            renderer.getActiveCamera().azimuth(30);
+            renderer.getActiveCamera().elevation(20);
+            renderer.resetCameraClippingRange();
+        }
+        renderWindow.render();
+    }, []);
+
+    const applySlicePaint = useCallback((info: SlicePaintInfo) => {
+        if (!context.current) return;
+        const { sliceIdx, pixelData, width, height, numSlices } = info;
+        if (sliceIdx < 0 || sliceIdx >= numSlices || !pixelData) return;
+
+        const meta = volumeMetadataRef.current;
+
+        if (meta) {
+            const { xyScale, origCols, origRows, zStep, dimensions } = meta;
+            const outCols   = dimensions[0] as number;
+            const outRows   = dimensions[1] as number;
+            const outSlices = dimensions[2] as number;
+            const needed    = outCols * outRows * outSlices;
+            if (!localLabelMapRef.current || localLabelMapRef.current.length !== needed) {
+                localLabelMapRef.current = new Uint8Array(needed);
+            }
+            const buf = localLabelMapRef.current;
+            const si  = Math.min(Math.floor(sliceIdx / Math.max(1, zStep)), outSlices - 1);
+            const dstBase = si * outCols * outRows;
+            if (xyScale === 1 && origCols === outCols) {
+                buf.set(pixelData.subarray(0, Math.min(pixelData.length, outCols * outRows)), dstBase);
+            } else {
+                for (let r = 0; r < outRows; r++) {
+                    for (let c = 0; c < outCols; c++) {
+                        buf[dstBase + r * outCols + c] =
+                            pixelData[(r * xyScale) * origCols + (c * xyScale)] ?? 0;
+                    }
+                }
+            }
+            ensureMaskActor(
+                buf,
+                [outCols, outRows, outSlices],
+                meta.spacing as [number, number, number],
+                meta.origin as [number, number, number],
+                meta.direction,
+            );
+            return;
+        }
+
+        const count = width * height * numSlices;
+        if (!localLabelMapRef.current || localLabelMapRef.current.length !== count) {
+            localLabelMapRef.current = new Uint8Array(count);
+        }
+        localLabelMapRef.current.set(pixelData, sliceIdx * width * height);
+        ensureMaskActor(
+            localLabelMapRef.current,
+            [width, height, numSlices],
+            [1, 1, 1],
+            [0, 0, 0],
+        );
+    }, [ensureMaskActor]);
+
     // Populate refreshLabelMapRef so CornerstoneViewer (or any caller) can push
     // labelmap data directly without going through React state.
     useEffect(() => {
         if (refreshLabelMapRef) refreshLabelMapRef.current = applyLabelMapData;
         return () => { if (refreshLabelMapRef) refreshLabelMapRef.current = null; };
     }, [applyLabelMapData, refreshLabelMapRef]);
+
+    useEffect(() => {
+        if (refreshSliceRef) refreshSliceRef.current = applySlicePaint;
+        return () => { if (refreshSliceRef) refreshSliceRef.current = null; };
+    }, [applySlicePaint, refreshSliceRef]);
+
+    // Apply any pending labelmap that arrived before Generate 3D was clicked.
+    useEffect(() => {
+        if (!volumeMetadata || !pendingLabelMapRef.current) return;
+        applyLabelMapData(pendingLabelMapRef.current);
+        pendingLabelMapRef.current = null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [volumeMetadata]);
 
     const captureScreenshot = async () => {
         if (!context.current) return;
@@ -1083,7 +1433,7 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
 
             {/* Export + Reset Camera + View Toggle Buttons */}
             {isGenerated && (
-                <div className="absolute top-4 left-4 z-10 flex gap-2">
+                <div className="absolute top-4 left-4 z-40 flex flex-wrap gap-2 max-w-[calc(100%-8rem)]">
                     <button
                         onClick={captureScreenshot}
                         className="bg-slate-800 hover:bg-slate-700 text-slate-300 p-2 rounded-lg border border-slate-700 shadow-lg transition-colors"
@@ -1118,41 +1468,54 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
                         </button>
                     )}
 
-                    {/* 3D Sphere Erase toggle */}
+                    {/* 3D tool: Move / Sphere erase / Lasso — exclusive, always clickable above overlays */}
                     {context.current?.maskVolume && (
-                        <button
-                            onClick={() => { setIs3DEraseMode(v => !v); setLassoMode(false); }}
-                            className={`px-3 py-2 rounded-lg border shadow-lg transition-colors text-xs font-semibold ${
-                                is3DEraseMode
-                                    ? 'bg-rose-700 hover:bg-rose-600 border-rose-500 text-white'
-                                    : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300'
-                            }`}
-                            title="구형 지우개: 드래그로 노이즈 제거"
-                        >
-                            {is3DEraseMode ? '✋ 이동' : '🧹 구형 지우기'}
-                        </button>
-                    )}
-
-                    {/* Lasso Erase toggle */}
-                    {context.current?.maskVolume && (
-                        <button
-                            onClick={() => { setLassoMode(v => !v); setIs3DEraseMode(false); }}
-                            className={`px-3 py-2 rounded-lg border shadow-lg transition-colors text-xs font-semibold ${
-                                lassoMode
-                                    ? 'bg-orange-700 hover:bg-orange-600 border-orange-500 text-white'
-                                    : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300'
-                            }`}
-                            title="올가미 지우기: 자유형 영역을 그려서 안쪽 노이즈 제거"
-                        >
-                            {lassoMode ? '✋ 이동' : '🔲 올가미 지우기'}
-                        </button>
+                        <>
+                            <button
+                                onClick={() => setTool3D('move')}
+                                className={`px-3 py-2 rounded-lg border shadow-lg transition-colors text-xs font-semibold ${
+                                    !is3DEraseMode && !lassoMode
+                                        ? 'bg-sky-700 hover:bg-sky-600 border-sky-500 text-white'
+                                        : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300'
+                                }`}
+                                title="카메라 이동 / 회전 (Esc)">
+                                ✋ 이동
+                            </button>
+                            <button
+                                onClick={() => setTool3D(is3DEraseMode ? 'move' : 'sphere')}
+                                className={`px-3 py-2 rounded-lg border shadow-lg transition-colors text-xs font-semibold ${
+                                    is3DEraseMode
+                                        ? 'bg-rose-700 hover:bg-rose-600 border-rose-500 text-white'
+                                        : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300'
+                                }`}
+                                title="구형 지우개: 드래그로 노이즈 제거">
+                                🧹 구형 지우기
+                            </button>
+                            <button
+                                onClick={() => setTool3D(lassoMode ? 'move' : 'lasso')}
+                                className={`px-3 py-2 rounded-lg border shadow-lg transition-colors text-xs font-semibold ${
+                                    lassoMode
+                                        ? 'bg-orange-700 hover:bg-orange-600 border-orange-500 text-white'
+                                        : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300'
+                                }`}
+                                title="올가미 지우기: 영역을 그려서 안쪽 제거">
+                                🔲 올가미 지우기
+                            </button>
+                            <button
+                                onClick={undo3DEdit}
+                                disabled={undoCount === 0}
+                                className="px-3 py-2 rounded-lg border shadow-lg transition-colors text-xs font-semibold bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300 disabled:opacity-30 disabled:cursor-not-allowed"
+                                title="작업 취소 (Ctrl+Z)">
+                                ↩ 실행취소{undoCount > 0 ? ` (${undoCount})` : ''}
+                            </button>
+                        </>
                     )}
                 </div>
             )}
 
             {/* Slice Navigation Controls (browse through the volume slice-by-slice) */}
             {isGenerated && !isLoading && (
-                <div className="absolute bottom-4 right-4 z-10 bg-slate-900/90 backdrop-blur p-4 rounded-lg border border-slate-700 shadow-xl w-64">
+                <div className="absolute bottom-4 right-4 z-40 bg-slate-900/90 backdrop-blur p-4 rounded-lg border border-slate-700 shadow-xl w-64">
                     <div className="flex items-center justify-between mb-3">
                         <span className="text-sm font-semibold text-slate-200">Slice Navigation</span>
                         <button
@@ -1296,13 +1659,13 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
                     <div className="px-3 py-2 border-t border-[#2a2a2a]">
                         <button
                             onClick={generateSurfaceMeshes}
-                            disabled={isLoading || (activeOrgans.size === 0 && !localLabelMapRef.current)}
+                            disabled={isLoading}
                             className="w-full py-1.5 rounded text-[11px] font-semibold bg-emerald-700 hover:bg-emerald-600 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
                             ⬡ Generate Model
                         </button>
-                        {activeOrgans.size === 0 && !localLabelMapRef.current && (
+                        {activeOrgans.size === 0 && (
                             <p className="text-[9px] text-slate-600 text-center mt-1">
-                                부위를 선택하거나 2D에서 색칠 후 클릭
+                                우측 레이어에서 체크한 부위만 생성됩니다
                             </p>
                         )}
                     </div>
@@ -1314,13 +1677,13 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
                 <div className="absolute top-3 right-3 z-10 pointer-events-none">
                     <div className="bg-black/70 backdrop-blur px-2.5 py-2 rounded-lg border border-[#333] text-[11px] space-y-1">
                         <div className="text-slate-500 text-[9px] uppercase tracking-wider mb-1">생성된 모델</div>
-                        {organDefs.filter(o => activeOrgans.has(o.id)).map(o => (
+                        {organDefs.filter(o => generatedOrganIds.includes(o.id) || activeOrgans.has(o.id)).map(o => (
                             <div key={o.id} className="flex items-center gap-1.5">
                                 <span className="w-3 h-3 rounded-sm shrink-0" style={{ backgroundColor: o.colorCss }} />
                                 <span className="text-slate-300">{o.label.split(' ')[0]}</span>
                             </div>
                         ))}
-                        {masksRef.current.filter(m => !activeOrgans.has(m.id) && localLabelMapRef.current &&
+                        {masksRef.current.filter(m => !generatedOrganIds.includes(m.id) && !activeOrgans.has(m.id) && localLabelMapRef.current &&
                             (() => { for(let i=0;i<(localLabelMapRef.current?.length??0);i++) if(localLabelMapRef.current![i]===m.segmentIndex) return true; return false; })()
                         ).map(m => (
                             <div key={m.id} className="flex items-center gap-1.5">
@@ -1334,7 +1697,7 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
 
             {/* Lasso mode hint */}
             {lassoMode && isGenerated && !lassoProcessing && (
-                <div className="absolute top-16 left-4 z-10 bg-orange-950/90 backdrop-blur px-3 py-2.5 rounded-lg border border-orange-700 shadow-xl w-52 pointer-events-none">
+                <div className="absolute top-16 left-4 z-40 bg-orange-950/90 backdrop-blur px-3 py-2.5 rounded-lg border border-orange-700 shadow-xl w-52 pointer-events-none">
                     <div className="text-xs font-semibold text-orange-300 mb-1">🔲 올가미 지우기 활성</div>
                     <div className="text-[10px] text-slate-400">
                         드래그로 영역을 그리면 닫힌 영역 내부의 세그멘테이션이 제거됩니다
@@ -1344,7 +1707,7 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
 
             {/* 3D Erase active — radius control + usage hint */}
             {is3DEraseMode && isGenerated && (
-                <div className="absolute top-16 left-4 z-10 bg-rose-950/90 backdrop-blur px-3 py-2.5 rounded-lg border border-rose-700 shadow-xl w-52">
+                <div className="absolute top-16 left-4 z-40 bg-rose-950/90 backdrop-blur px-3 py-2.5 rounded-lg border border-rose-700 shadow-xl w-52">
                     <div className="text-xs font-semibold text-rose-300 mb-2">🧹 3D 지우개 활성</div>
                     <div className="space-y-1">
                         <div className="flex justify-between text-xs text-slate-400">
@@ -1358,7 +1721,7 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
                         />
                     </div>
                     <div className="text-[10px] text-slate-500 mt-2">
-                        드래그로 노이즈 제거 · 완료 후 이동 모드 전환
+                        드래그로 노이즈 제거 · <b className="text-slate-400">이동</b> 버튼 또는 Esc로 카메라 조작
                     </div>
                 </div>
             )}
@@ -1371,7 +1734,7 @@ function VTKViewer({ files, masks = [], onError, onGeneratingChange, generateRef
             )}
 
             {/* Generate Button Overlay — shown before 3D is generated */}
-            {!isGenerated && !isLoading && files && files.length > 0 && (
+            {!isGenerated && !isLoading && !hasLiveMask && files && files.length > 0 && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 z-10">
                     <div className="bg-[#1e1e1e]/90 border border-[#333] rounded-xl px-6 py-4 max-w-xs text-center space-y-2">
                         <div className="text-slate-300 font-semibold text-sm">3D 볼륨 생성</div>

@@ -2,8 +2,10 @@ import { useRef, useState, useCallback } from 'react'
 import VTKViewer from './components/VTKViewer'
 import CornerstoneViewer, { type DicomMetadata } from './components/CornerstoneViewer'
 import MPRViewer from './components/MPRViewer'
+import MPRSinglePane from './components/MPRSinglePane'
 import MaskPanel from './components/MaskPanel'
 import { DEFAULT_MASKS, type Mask } from './types/mask'
+import { useMPRVolume } from './hooks/useMPRVolume'
 import './App.css'
 
 function App() {
@@ -11,13 +13,15 @@ function App() {
   const [selectedFiles,  setSelectedFiles]  = useState<File[] | null>(null);
   const [caseMeta,       setCaseMeta]       = useState<DicomMetadata | null>(null);
   const [toast,          setToast]          = useState<string | null>(null);
-  const [viewMode,       setViewMode]       = useState<'2d' | 'mpr'>('2d');
+  const [viewMode,       setViewMode]       = useState<'2d' | 'mpr' | 'quad'>('2d');
   const fileInputRef     = useRef<HTMLInputElement>(null);
   const toastTimerRef    = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Mask state (shared between MaskPanel, CornerstoneViewer, VTKViewer) ──
   const [masks,          setMasks]          = useState<Mask[]>(DEFAULT_MASKS);
   const [activeMaskId,   setActiveMaskId]   = useState<string>('bone');
+  /** Layers checked in MaskPanel — Generate 3D uses only these */
+  const [selectedMaskIds, setSelectedMaskIds] = useState<string[]>(['bone']);
   const [brushMode,      setBrushMode]      = useState<'draw' | 'erase'>('draw');
   // Incremented every time Draw or Erase is clicked in MaskPanel, so
   // CornerstoneViewer's useEffect always fires (even if mode doesn't change).
@@ -26,18 +30,36 @@ function App() {
   const [brushHuMax,     setBrushHuMax]     = useState(3000);
   const [fillProgress,   setFillProgress]   = useState<number | null>(null);
   const [isGenerating,   setIsGenerating]   = useState(false);
+  // Smart Brush: ON = paint only HU-matching pixels INSIDE the brush circle.
+  const [gatePreviewActive, setGatePreviewActive] = useState(true);
+
+  // ── MPR shared volume (quad layout) ──────────────────────────────────────
+  // Loaded lazily: only when quad mode is activated
+  const { volume: mprVolume, loading: mprLoading, progress: mprProgress } =
+    useMPRVolume(viewMode === 'quad' ? selectedFiles : null);
+  // Tracks the current axial slice index for crosshair linking in quad mode
+  const [axialSliceIdx, setAxialSliceIdx] = useState(0);
 
   // ── VTK / 3D ──────────────────────────────────────────────────────────────
   // generateRef: parent calls ref.current() to trigger 3D generation in VTKViewer
   const vtkGenerateRef      = useRef<(() => void) | null>(null);
   // refreshLabelMapRef: VTKViewer populates this; CornerstoneViewer calls it to push
   // the labelmap directly (zero React-state copy)
-  const vtkRefreshLabelMapRef = useRef<((data: Uint8Array) => void) | null>(null);
+    const vtkRefreshLabelMapRef = useRef<((data: Uint8Array) => void) | null>(null);
+    const vtkRefreshSliceRef    = useRef<((info: {
+        sliceIdx: number; pixelData: Uint8Array; width: number; height: number; numSlices: number;
+    }) => void) | null>(null);
   const csViewerRef           = useRef<{
     fillCurrentSlice:          () => void;
     fillAllSlices:             () => void;
     sendTo3D:                  () => void;
     applyOrgansSegmentation:   (organs: { id: string; huMin: number; huMax: number }[]) => Promise<void>;
+    apply3DLabelMap:           (info: {
+        data: Uint8Array;
+        volW: number; volH: number; volD: number;
+        xyScale: number; zStep: number;
+        previous?: Uint8Array;
+    }) => void;
   } | null>(null);
 
   // Sync active mask HU range to brush when mask changes
@@ -45,10 +67,14 @@ function App() {
     setActiveMaskId(id);
     const m = masks.find(x => x.id === id);
     if (m) { setBrushHuMin(m.huMin); setBrushHuMax(m.huMax); }
+    // 장기를 선택하면 HU Gate Preview를 자동으로 활성화
+    setGatePreviewActive(true);
   }, [masks]);
 
   const handleMasksChange = useCallback((updated: Mask[]) => {
     setMasks(updated);
+    const ids = new Set(updated.map(m => m.id));
+    setSelectedMaskIds(prev => prev.filter(id => ids.has(id)));
     const active = updated.find(m => m.id === activeMaskId);
     if (active) { setBrushHuMin(active.huMin); setBrushHuMax(active.huMax); }
   }, [activeMaskId]);
@@ -87,32 +113,33 @@ function App() {
     ? `${caseMeta.patientName ?? 'Unknown'} · ${caseMeta.modality ?? '—'}${caseMeta.studyDescription ? ' · ' + caseMeta.studyDescription : ''}`
     : selectedFiles ? 'Loading study…' : null;
 
-  const isCT = caseMeta?.modality === 'CT';
+  // Show CT-specific tools if modality is CT, unknown, or not yet loaded (files present)
+  const isCT = !caseMeta?.modality || caseMeta.modality === 'CT' || caseMeta.modality === '' || caseMeta.modality === 'UNKNOWN';
 
   return (
-    <div className="flex flex-col h-screen w-full bg-[#141414] text-slate-200 font-sans overflow-hidden">
+    <div className="flex flex-col h-screen w-full bg-[#0d0d1a] text-slate-200 font-sans overflow-hidden">
 
-      {/* ── Header toolbar ────────────────────────────────────────────────── */}
-      <header className="h-10 bg-[#1a1a1a] border-b border-[#333] flex items-center px-3 gap-2 shrink-0">
+      {/* ── Header toolbar (OHIF style) ─────────────────────────────────────── */}
+      <header className="h-11 bg-[#16162a] border-b border-[#2d2d50] flex items-center px-3 gap-1.5 shrink-0">
 
         {/* Logo */}
-        <span className="text-sm font-bold text-sky-400 tracking-tight mr-2">MediCare</span>
-        <div className="w-px h-5 bg-[#333]" />
+        <span className="text-sm font-bold text-sky-400 tracking-tight mr-2">MediSeg</span>
+        <div className="w-px h-5 bg-[#2d2d50]" />
 
         {/* File open buttons */}
         <button onClick={() => fileInputRef.current?.click()}
-          className="flex items-center gap-1.5 px-2.5 py-1 rounded text-xs bg-[#2a2a2a] hover:bg-[#333] text-slate-300 border border-[#3a3a3a] transition-colors">
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] bg-[#1e1e38] hover:bg-[#2a2a50] text-slate-300 border border-[#3a3a60] transition-colors">
           <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>
           </svg>
-          Open Folder
+          Series
         </button>
         <input type="file" ref={fileInputRef} onChange={handleFileChange}
           // @ts-expect-error webkitdirectory not in React types
           webkitdirectory="" directory="" multiple className="hidden" />
 
         <button onClick={() => document.getElementById('file-input-single')?.click()}
-          className="flex items-center gap-1.5 px-2.5 py-1 rounded text-xs bg-[#2a2a2a] hover:bg-[#333] text-slate-300 border border-[#3a3a3a] transition-colors">
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] bg-[#1e1e38] hover:bg-[#2a2a50] text-slate-300 border border-[#3a3a60] transition-colors">
           <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/>
             <polyline points="13 2 13 9 20 9"/>
@@ -121,25 +148,46 @@ function App() {
         </button>
         <input id="file-input-single" type="file" onChange={handleFileChange} multiple className="hidden" />
 
-        <div className="w-px h-5 bg-[#333]" />
+        <div className="w-px h-5 bg-[#2d2d50]" />
 
         {/* View mode */}
-        <div className="flex bg-[#111] rounded p-0.5 gap-0.5">
-          {(['2d', 'mpr'] as const).map(v => (
-            <button key={v} onClick={() => setViewMode(v)}
-              className={`px-2.5 py-0.5 rounded text-xs font-semibold transition-colors ${
-                viewMode === v ? 'bg-sky-700 text-white' : 'text-slate-500 hover:text-slate-300'
+        <div className="flex bg-[#111120] rounded p-0.5 gap-0.5">
+          {([
+            { id: '2d',   label: '2D' },
+            { id: 'mpr',  label: 'MPR' },
+            { id: 'quad', label: '4분할' },
+          ] as const).map(v => (
+            <button key={v.id} onClick={() => setViewMode(v.id)}
+              className={`px-2.5 py-1 rounded text-[11px] font-semibold transition-colors ${
+                viewMode === v.id ? 'bg-sky-700 text-white' : 'text-slate-500 hover:text-slate-300'
               }`}>
-              {v.toUpperCase()}
+              {v.label}
             </button>
           ))}
         </div>
 
+        <div className="w-px h-5 bg-[#2d2d50]" />
+
+        {/* Quick tool shortcuts */}
+        {(['Zoom (Z)', 'Levels (L)', 'Pan (P)'] as const).map(label => (
+          <button key={label}
+            className="px-2 py-1 rounded text-[11px] text-slate-400 hover:bg-[#1e1e38] hover:text-slate-200 transition-colors">
+            {label}
+          </button>
+        ))}
+
+        <div className="w-px h-5 bg-[#2d2d50]" />
+
+        {/* Segment+ button */}
+        <button className="flex items-center gap-1 px-2.5 py-1 rounded text-[11px] font-semibold text-sky-300 border border-sky-700 hover:bg-sky-900/30 transition-colors">
+          Segment+
+        </button>
+
         {/* Patient info */}
         {patientInfo && (
           <>
-            <div className="w-px h-5 bg-[#333]" />
-            <span className="text-xs text-slate-400 truncate max-w-xs">{patientInfo}</span>
+            <div className="w-px h-5 bg-[#2d2d50]" />
+            <span className="text-[11px] text-slate-400 truncate max-w-xs">{patientInfo}</span>
           </>
         )}
 
@@ -147,85 +195,221 @@ function App() {
 
         {/* File count badge */}
         {selectedFiles && (
-          <span className="text-[10px] bg-[#2a2a2a] border border-[#3a3a3a] text-slate-400 px-2 py-0.5 rounded font-mono">
-            {selectedFiles.length} files
+          <span className="text-[10px] bg-[#1e1e38] border border-[#3a3a60] text-slate-400 px-2 py-0.5 rounded font-mono">
+            {selectedFiles.length} imgs
           </span>
         )}
+
+        {/* Contours / Segments tabs */}
+        <div className="flex bg-[#111120] rounded p-0.5 gap-0.5 ml-1">
+          <button className="px-2.5 py-0.5 rounded text-[11px] text-slate-500 hover:text-slate-300 transition-colors">Contours</button>
+          <button className="px-2.5 py-0.5 rounded text-[11px] bg-sky-700 text-white font-semibold">Segments</button>
+        </div>
       </header>
 
       {/* ── Main content ──────────────────────────────────────────────────── */}
       <div className="flex flex-1 min-h-0">
 
-        {/* Left: 2D / MPR viewer */}
-        <div className="flex flex-col border-r border-[#2a2a2a] min-w-0" style={{ width: '45%' }}>
-
-          {/* 2D sub-header */}
-          <div className="h-7 bg-[#1a1a1a] border-b border-[#2a2a2a] flex items-center px-3 gap-2 shrink-0">
-            <span className="text-[10px] text-slate-500 font-medium uppercase tracking-wider">2D View</span>
-            {caseMeta?.modality && (
-              <span className="text-[10px] bg-[#2a2a2a] text-slate-400 px-1.5 py-0.5 rounded font-mono">
-                {caseMeta.modality}
-              </span>
-            )}
-          </div>
-
-          {/* Cornerstone 2D viewer */}
-          <div className={`flex-1 bg-black relative overflow-hidden ${viewMode === 'mpr' ? 'hidden' : ''}`}>
-            <CornerstoneViewer
-              files={selectedFiles}
-              masks={masks}
-              activeMaskId={activeMaskId}
-              brushMode={brushMode}
-              brushModeTick={brushModeTick}
-              brushHuMin={brushHuMin}
-              brushHuMax={brushHuMax}
-              onMetadataChange={setCaseMeta}
-              onFillProgressChange={setFillProgress}
-              vtkRefreshLabelMapRef={vtkRefreshLabelMapRef}
-              imperativeRef={csViewerRef}
-            />
-          </div>
-
-          {/* MPR viewer */}
-          {viewMode === 'mpr' && (
-            <div className="flex-1 bg-black relative overflow-hidden">
-              <MPRViewer files={selectedFiles} />
+        {/* ── 2D mode: [Cornerstone (45%)] [VTK (flex-1)] ─────────────────── */}
+        {viewMode === '2d' && (
+          <>
+            <div className="flex flex-col border-r border-[#2d2d50] min-w-0 min-h-0" style={{ width: '45%' }}>
+              <div className="h-7 bg-[#16162a] border-b border-[#2d2d50] flex items-center px-3 gap-2 shrink-0">
+                <span className="text-[10px] text-slate-500 font-medium uppercase tracking-wider">Axial</span>
+                {caseMeta?.modality && (
+                  <span className="text-[10px] bg-[#1e1e38] text-slate-400 px-1.5 py-0.5 rounded font-mono">
+                    {caseMeta.modality}
+                  </span>
+                )}
+              </div>
+              <div className="flex-1 min-h-0 bg-black relative overflow-hidden">
+                <CornerstoneViewer
+                  files={selectedFiles}
+                  masks={masks}
+                  activeMaskId={activeMaskId}
+                  brushMode={brushMode}
+                  brushModeTick={brushModeTick}
+                  brushHuMin={brushHuMin}
+                  brushHuMax={brushHuMax}
+                  gatePreviewActive={gatePreviewActive}
+                  onGatePreviewChange={setGatePreviewActive}
+                  onMetadataChange={setCaseMeta}
+                  onFillProgressChange={setFillProgress}
+                  vtkRefreshLabelMapRef={vtkRefreshLabelMapRef}
+                  vtkRefreshSliceRef={vtkRefreshSliceRef}
+                  imperativeRef={csViewerRef}
+                />
+              </div>
             </div>
-          )}
-        </div>
 
-        {/* Center: 3D view */}
-        <div className="flex flex-col min-w-0 flex-1">
-          <div className="h-7 bg-[#1a1a1a] border-b border-[#2a2a2a] flex items-center px-3 gap-2 shrink-0">
-            <span className="text-[10px] text-slate-500 font-medium uppercase tracking-wider">3D View</span>
-          </div>
+            <div className="flex flex-col min-w-0 min-h-0 flex-1">
+              <div className="h-7 bg-[#16162a] border-b border-[#2d2d50] flex items-center px-3 gap-2 shrink-0">
+                <span className="text-[10px] text-slate-500 font-medium uppercase tracking-wider">3D View</span>
+              </div>
+              <div className="flex-1 min-h-0 bg-[#0d0d0d] relative overflow-hidden">
+                {selectedFiles && selectedFiles.length > 0 ? (
+                  <VTKViewer
+                    files={selectedFiles}
+                    masks={masks}
+                    selectedMaskIds={selectedMaskIds}
+                    onError={showToast}
+                    onGeneratingChange={setIsGenerating}
+                    generateRef={vtkGenerateRef}
+                    refreshLabelMapRef={vtkRefreshLabelMapRef}
+                    refreshSliceRef={vtkRefreshSliceRef}
+                    onSegmentationGenerated={async (organs) => {
+                      await csViewerRef.current?.applyOrgansSegmentation(organs);
+                      csViewerRef.current?.sendTo3D();
+                    }}
+                    on3DLabelMapEdited={(info) => {
+                      csViewerRef.current?.apply3DLabelMap(info);
+                    }}
+                  />
+                ) : (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 pointer-events-none">
+                    <svg className="w-12 h-12 text-slate-700" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M21 7.5l-9-5.25L3 7.5m18 0l-9 5.25m9-5.25v9l-9 5.25M3 7.5l9 5.25M3 7.5v9l9 5.25m0-9v9"/>
+                    </svg>
+                    <p className="text-slate-600 text-sm">DICOM 파일을 불러오면 3D 뷰가 활성화됩니다</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* ── MPR mode: 3-panel axial/sagittal/coronal ─────────────────────── */}
+        {viewMode === 'mpr' && (
           <div className="flex-1 bg-black relative overflow-hidden">
-            <VTKViewer
-              files={selectedFiles}
-              masks={masks}
-              onError={showToast}
-              onGeneratingChange={setIsGenerating}
-              generateRef={vtkGenerateRef}
-              refreshLabelMapRef={vtkRefreshLabelMapRef}
-              onSegmentationGenerated={(organs) => csViewerRef.current?.applyOrgansSegmentation(organs)}
-            />
+            <MPRViewer files={selectedFiles} />
           </div>
-        </div>
+        )}
+
+        {/* ── Quad mode: 2×2 grid ──────────────────────────────────────────── */}
+        {viewMode === 'quad' && (
+          <div className="flex-1 min-h-0 grid grid-cols-2 grid-rows-2"
+               style={{ gridTemplateColumns: '1fr 1fr', gridTemplateRows: '1fr 1fr' }}>
+
+            {/* Top-left: Axial (full CornerstoneViewer with segmentation tools) */}
+            <div className="border-r border-b border-[#2d2d50] min-h-0 flex flex-col">
+              <div className="h-6 bg-[#16162a] border-b border-[#1c9ae055] flex items-center px-2 shrink-0">
+                <span className="text-[10px] font-bold text-[#60a5fa]">AXIAL</span>
+                {caseMeta?.modality && (
+                  <span className="ml-2 text-[9px] bg-[#1e1e38] text-slate-500 px-1 rounded font-mono">
+                    {caseMeta.modality}
+                  </span>
+                )}
+              </div>
+              <div className="flex-1 bg-black overflow-hidden">
+                <CornerstoneViewer
+                  files={selectedFiles}
+                  masks={masks}
+                  activeMaskId={activeMaskId}
+                  brushMode={brushMode}
+                  brushModeTick={brushModeTick}
+                  brushHuMin={brushHuMin}
+                  brushHuMax={brushHuMax}
+                  gatePreviewActive={gatePreviewActive}
+                  onGatePreviewChange={setGatePreviewActive}
+                  onMetadataChange={setCaseMeta}
+                  onFillProgressChange={setFillProgress}
+                  onSliceChange={setAxialSliceIdx}
+                  vtkRefreshLabelMapRef={vtkRefreshLabelMapRef}
+                  vtkRefreshSliceRef={vtkRefreshSliceRef}
+                  imperativeRef={csViewerRef}
+                />
+              </div>
+            </div>
+
+            {/* Top-right: Sagittal */}
+            <div className="border-b border-[#2d2d50] min-h-0">
+              {mprLoading ? (
+                <div className="w-full h-full flex flex-col items-center justify-center gap-2 bg-black">
+                  <div className="w-28 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                    <div className="h-full bg-sky-600 rounded-full transition-all"
+                      style={{ width: `${mprProgress}%` }} />
+                  </div>
+                  <span className="text-[10px] text-slate-600">볼륨 로딩 {mprProgress}%</span>
+                </div>
+              ) : (
+                <MPRSinglePane
+                  volume={mprVolume}
+                  plane="sagittal"
+                  accentColor="#22c55e"
+                  axialIdx={axialSliceIdx}
+                  windowCenter={40}
+                  windowWidth={400}
+                />
+              )}
+            </div>
+
+            {/* Bottom-left: Coronal */}
+            <div className="border-r border-[#2d2d50] min-h-0">
+              {mprLoading ? (
+                <div className="w-full h-full flex flex-col items-center justify-center gap-2 bg-black">
+                  <span className="text-[10px] text-slate-600">볼륨 로딩…</span>
+                </div>
+              ) : (
+                <MPRSinglePane
+                  volume={mprVolume}
+                  plane="coronal"
+                  accentColor="#f97316"
+                  axialIdx={axialSliceIdx}
+                  windowCenter={40}
+                  windowWidth={400}
+                />
+              )}
+            </div>
+
+            {/* Bottom-right: 3D VTK viewer */}
+            <div className="min-h-0 bg-[#0d0d0d] relative">
+              <div className="absolute top-0 left-0 px-2 py-1 z-10 text-[10px] font-bold text-slate-500
+                              bg-[#16162a]/80 border-b border-r border-[#2d2d50]">3D</div>
+              {selectedFiles && selectedFiles.length > 0 ? (
+                <VTKViewer
+                  files={selectedFiles}
+                  masks={masks}
+                  selectedMaskIds={selectedMaskIds}
+                  onError={showToast}
+                  onGeneratingChange={setIsGenerating}
+                  generateRef={vtkGenerateRef}
+                  refreshLabelMapRef={vtkRefreshLabelMapRef}
+                  refreshSliceRef={vtkRefreshSliceRef}
+                  onSegmentationGenerated={async (organs) => {
+                    await csViewerRef.current?.applyOrgansSegmentation(organs);
+                    csViewerRef.current?.sendTo3D();
+                  }}
+                  on3DLabelMapEdited={(info) => {
+                    csViewerRef.current?.apply3DLabelMap(info);
+                  }}
+                />
+              ) : (
+                <div className="absolute inset-0 flex items-center justify-center text-slate-700 text-xs">
+                  DICOM 로드 후 3D 활성화
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Right: Mask Control panel */}
         <MaskPanel
           masks={masks}
           activeMaskId={activeMaskId}
+          selectedMaskIds={selectedMaskIds}
+          onSelectedMaskIdsChange={setSelectedMaskIds}
           brushMode={brushMode}
           brushHuMin={brushHuMin}
           brushHuMax={brushHuMax}
           isCT={isCT}
           fillProgress={fillProgress}
           isGenerating={isGenerating}
+          gatePreviewActive={gatePreviewActive}
           onMasksChange={handleMasksChange}
           onActiveMaskChange={handleActiveMaskChange}
           onBrushModeChange={(mode) => { setBrushMode(mode); setBrushModeTick(t => t + 1); }}
           onBrushHuChange={handleBrushHuChange}
+          onGatePreviewChange={setGatePreviewActive}
           onGenerateModel={() => vtkGenerateRef.current?.()}
           onFillCurrentSlice={() => csViewerRef.current?.fillCurrentSlice()}
           onFillAllSlices={() => csViewerRef.current?.fillAllSlices()}

@@ -35,15 +35,21 @@ interface OrganResult {
 
 self.onmessage = (event: MessageEvent<WorkerInput>) => {
     const { ctScalars, organs, totalVox } = event.data;
-    const results: OrganResult[] = [];
+    const binaries = organs.map(() => new Uint8Array(totalVox));
 
-    for (const { id, huMin, huMax } of organs) {
-        const binary = new Uint8Array(totalVox);
-        for (let i = 0; i < totalVox; i++) {
-            binary[i] = ctScalars[i] >= huMin && ctScalars[i] <= huMax ? 1 : 0;
+    // First matching organ wins so overlapping HU ranges (liver/kidney/spleen)
+    // do not paint the same voxel into multiple meshes.
+    for (let i = 0; i < totalVox; i++) {
+        const hu = ctScalars[i];
+        for (let o = 0; o < organs.length; o++) {
+            if (hu >= organs[o].huMin && hu <= organs[o].huMax) {
+                binaries[o][i] = 1;
+                break;
+            }
         }
-        results.push({ id, binary });
     }
+
+    const results: OrganResult[] = organs.map(({ id }, o) => ({ id, binary: binaries[o] }));
 
     // Transfer Uint8Array buffers so the main thread receives them without copying.
     const transferables = results.map(r => r.binary.buffer);
