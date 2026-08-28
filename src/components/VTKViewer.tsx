@@ -11,6 +11,7 @@ import vtkPiecewiseFunction from '@kitware/vtk.js/Common/DataModel/PiecewiseFunc
 import vtkImageData from '@kitware/vtk.js/Common/DataModel/ImageData';
 import vtkDataArray from '@kitware/vtk.js/Common/Core/DataArray';
 import vtkImageMarchingCubes from '@kitware/vtk.js/Filters/General/ImageMarchingCubes';
+import vtkWindowedSincPolyDataFilter from '@kitware/vtk.js/Filters/General/WindowedSincPolyDataFilter';
 import vtkPlane from '@kitware/vtk.js/Common/DataModel/Plane';
 import vtkInteractorStyleManipulator from '@kitware/vtk.js/Interaction/Style/InteractorStyleManipulator';
 import vtkMouseCameraTrackballRotateManipulator from '@kitware/vtk.js/Interaction/Manipulators/MouseCameraTrackballRotateManipulator';
@@ -23,6 +24,78 @@ import type { Mask } from '../types/mask';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type VtkActorInstance = any;
+
+/** Separable 3D blur so marching-cubes surfaces are not voxel-staircased. */
+function blurMask3D(src: Uint8Array, W: number, H: number, D: number): Float32Array {
+    const n = W * H * D;
+    let cur = new Float32Array(n);
+    for (let i = 0; i < n; i++) cur[i] = src[i] ? 1 : 0;
+    const tmp = new Float32Array(n);
+    const pass = (from: Float32Array, to: Float32Array, dx: number, dy: number, dz: number) => {
+        const step = dx + dy * W + dz * W * H;
+        for (let z = 0; z < D; z++) {
+            for (let y = 0; y < H; y++) {
+                for (let x = 0; x < W; x++) {
+                    const i = x + y * W + z * W * H;
+                    const lo = (x - dx >= 0 && y - dy >= 0 && z - dz >= 0) ? i - step : i;
+                    const hi = (x + dx < W && y + dy < H && z + dz < D) ? i + step : i;
+                    to[i] = (from[lo] + 2 * from[i] + from[hi]) * 0.25;
+                }
+            }
+        }
+    };
+    pass(cur, tmp, 1, 0, 0); pass(tmp, cur, 0, 1, 0); pass(cur, tmp, 0, 0, 1);
+    pass(tmp, cur, 1, 0, 0); pass(cur, tmp, 0, 1, 0); pass(tmp, cur, 0, 0, 1);
+    return cur;
+}
+
+function addSmoothedMeshActor(
+    renderer: { addActor: (a: VtkActorInstance) => void },
+    binary: Uint8Array,
+    W: number, H: number, D: number,
+    spacing: [number, number, number],
+    origin: [number, number, number],
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    direction: any,
+    r: number, g: number, b: number,
+): VtkActorInstance {
+    const floats = blurMask3D(binary, W, H, D);
+    const maskImg = vtkImageData.newInstance();
+    maskImg.setDimensions([W, H, D]);
+    maskImg.setSpacing(spacing);
+    maskImg.setOrigin(origin);
+    if (direction) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        maskImg.setDirection(direction as any);
+    }
+    const arr = vtkDataArray.newInstance({ name: 'scalars', values: floats, numberOfComponents: 1 });
+    maskImg.getPointData().setScalars(arr);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mc = (vtkImageMarchingCubes as any).newInstance({ contourValue: 0.45, computeNormals: true });
+    mc.setInputData(maskImg);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sinc = (vtkWindowedSincPolyDataFilter as any).newInstance({
+        numberOfIterations: 12,
+        passBand: 0.1,
+        featureEdgeSmoothing: 0,
+        boundarySmoothing: 1,
+    });
+    sinc.setInputConnection(mc.getOutputPort());
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const meshMapper = (vtkMapper as any).newInstance();
+    meshMapper.setInputConnection(sinc.getOutputPort());
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const meshActor = (vtkActor as any).newInstance();
+    meshActor.setMapper(meshMapper);
+    meshActor.getProperty().setColor(r, g, b);
+    meshActor.getProperty().setOpacity(0.92);
+    meshActor.getProperty().setAmbient(0.3);
+    meshActor.getProperty().setDiffuse(0.7);
+    meshActor.getProperty().setSpecular(0.35);
+    meshActor.getProperty().setSpecularPower(20);
+    renderer.addActor(meshActor);
+    return meshActor;
+}
 
 export interface SlicePaintInfo {
     sliceIdx:  number;
@@ -47,8 +120,6 @@ interface VTKViewerProps {
     refreshLabelMapRef?: React.MutableRefObject<((data: Uint8Array) => void) | null>;
     /** Live per-slice paint from 2D brush — updates 3D without copying the full volume */
     refreshSliceRef?: React.MutableRefObject<((info: SlicePaintInfo) => void) | null>;
-    /** Called after HU-based 3D generation so CornerstoneViewer can color matching 2D slices */
-    onSegmentationGenerated?: (organs: { id: string; huMin: number; huMax: number }[]) => void;
     /** Called after 3D lasso/sphere erase/undo so 2D slices stay in sync */
     on3DLabelMapEdited?: (info: {
         data: Uint8Array;
@@ -56,6 +127,8 @@ interface VTKViewerProps {
         xyScale: number; zStep: number;
         previous?: Uint8Array;
     }) => void;
+    /** 3D 부위 표시가 바뀔 때 2D 오버레이와 맞추기 위해 알림. null = 아직 생성 전 */
+    onVisibleOrgansChange?: (ids: string[] | null) => void;
 }
 
 type FullScreenRenderer = ReturnType<typeof vtkFullScreenRenderWindow.newInstance>;
@@ -68,7 +141,7 @@ interface VtkContext {
     maskVolume: VtkVolumeActor | null;
 }
 
-function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGeneratingChange, generateRef, refreshLabelMapRef, refreshSliceRef, onSegmentationGenerated, on3DLabelMapEdited }: VTKViewerProps) {
+function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGeneratingChange, generateRef, refreshLabelMapRef, refreshSliceRef, on3DLabelMapEdited, onVisibleOrgansChange }: VTKViewerProps) {
     const vtkContainerRef = useRef<HTMLDivElement>(null);
     const context = useRef<VtkContext | null>(null);
     const [isLoading,      setIsLoading]      = useState(false);
@@ -79,6 +152,17 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
 
     // Refs for surface mesh actors — cleaned up before each Generate Model run
     const meshActorsRef = useRef<VtkActorInstance[]>([]);
+    const meshActorByIdRef = useRef<Record<string, VtkActorInstance>>({});
+    const ensureMaskActorRef = useRef<((
+        values: Uint8Array,
+        dims: [number, number, number],
+        spacing: [number, number, number],
+        origin: [number, number, number],
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        direction?: any,
+    ) => void) | null>(null);
+    const rebuildMeshesFromLabelMapRef = useRef<() => Promise<void>>(async () => {});
+    const meshRebuildTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     // Keep a ref to masks for use in generateSurfaceMeshes callback
     const masksRef      = useRef<Mask[]>(masks);
     masksRef.current    = masks;
@@ -86,7 +170,7 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
     selectedMaskIdsRef.current = selectedMaskIds;
 
     // ── Per-organ HU segmentation state ──────────────────────────────────────
-    // activeOrgans: which organs are toggled ON for 3D generation/visualization
+    // activeOrgans: which organs are currently visible in the 3D view
     const [activeOrgans, setActiveOrgans] = useState<Set<string>>(new Set());
 
     // Local per-organ HU overrides (start from masks props, user can adjust in panel)
@@ -109,11 +193,61 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
     organDefsRef.current = organDefs;
     const activeOrgansRef = useRef(activeOrgans);
     activeOrgansRef.current = activeOrgans;
+    const onVisibleOrgansChangeRef = useRef(onVisibleOrgansChange);
+    onVisibleOrgansChangeRef.current = onVisibleOrgansChange;
+
+    const emitVisibleOrgans = (ids: string[] | null) => {
+        onVisibleOrgansChangeRef.current?.(ids);
+    };
+
+    const applyMaskSegmentVisibility = (visibleIds: Set<string>) => {
+        if (!context.current?.maskVolume) return;
+        const ofun = vtkPiecewiseFunction.newInstance();
+        ofun.addPoint(0, 0);
+        ofun.addPoint(0.5, 0);
+        for (const m of masksRef.current) {
+            const on = visibleIds.has(m.id);
+            const idx = m.segmentIndex;
+            ofun.addPoint(idx - 0.05, 0);
+            ofun.addPoint(idx, on ? 0.92 : 0);
+            ofun.addPoint(idx + 0.9, on ? 0.92 : 0);
+        }
+        try {
+            context.current.maskVolume.getProperty().setScalarOpacity(0, ofun);
+        } catch { /* ignore */ }
+    };
+
+    const isOrganShown = (id: string, selected: Set<string>) => {
+        const m = masksRef.current.find(x => x.id === id);
+        if (m?.visible === false) return false;
+        return selected.has(id);
+    };
+
+    const applyOrganVisibility = (id: string, visible: boolean) => {
+        const actor = meshActorByIdRef.current[id];
+        if (actor) {
+            try { actor.setVisibility(visible); } catch { /* ignore */ }
+        }
+        context.current?.renderWindow?.render();
+    };
+
+    const applyAllOrganVisibility = (visibleIds: Set<string>) => {
+        Object.entries(meshActorByIdRef.current).forEach(([id, actor]) => {
+            try { actor.setVisibility(isOrganShown(id, visibleIds)); } catch { /* ignore */ }
+        });
+        applyMaskSegmentVisibility(new Set([...visibleIds].filter(id => isOrganShown(id, visibleIds))));
+        context.current?.renderWindow?.render();
+    };
 
     const toggleOrgan = (id: string) => {
         setActiveOrgans(prev => {
             const next = new Set(prev);
-            if (next.has(id)) { next.delete(id); } else { next.add(id); }
+            const turningOn = !next.has(id);
+            if (turningOn) next.add(id); else next.delete(id);
+            applyOrganVisibility(id, isOrganShown(id, next));
+            applyMaskSegmentVisibility(new Set([...next].filter(x => isOrganShown(x, next))));
+            emitVisibleOrgans([...next]);
+            context.current?.renderWindow?.render();
             return next;
         });
     };
@@ -172,7 +306,7 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
     const on3DEditedRef = useRef(on3DLabelMapEdited);
     on3DEditedRef.current = on3DLabelMapEdited;
 
-    const syncLabelMapTo2D = (previous?: Uint8Array) => {
+    const syncLabelMapTo2D = () => {
         const data = localLabelMapRef.current;
         if (!data || !on3DEditedRef.current) return;
         const meta = volumeMetadataRef.current;
@@ -186,7 +320,7 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
             volW = d[0]; volH = d[1]; volD = d[2];
         } else return;
         if (volW <= 0) return;
-        on3DEditedRef.current({ data, volW, volH, volD, xyScale, zStep, previous });
+        on3DEditedRef.current({ data, volW, volH, volD, xyScale, zStep });
     };
 
     // ── 3D Erase + Lasso ─────────────────────────────────────────────────────
@@ -221,7 +355,6 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
     const undo3DEdit = () => {
         const prev = undoStackRef.current.pop();
         if (!prev || !localLabelMapRef.current) return;
-        const edited = new Uint8Array(localLabelMapRef.current);
         localLabelMapRef.current.set(prev);
         try {
             maskScalarsRef.current?.modified();
@@ -230,7 +363,8 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
             context.current?.renderWindow?.render();
         } catch { /* ignore */ }
         setUndoCount(undoStackRef.current.length);
-        syncLabelMapTo2D(edited);
+        syncLabelMapTo2D();
+        rebuildMeshesFromLabelMapRef.current();
     };
 
     const setTool3D = (tool: 'move' | 'sphere' | 'lasso') => {
@@ -339,11 +473,15 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
             } else if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
                 e.preventDefault();
                 undo3DEdit();
+            } else if (e.key === 'q' || e.key === 'Q') {
+                e.preventDefault();
+                setTool3D(is3DEraseMode ? 'move' : 'sphere');
+            } else if (e.key === 'o' || e.key === 'O') {
+                e.preventDefault();
+                setTool3D(lassoMode ? 'move' : 'lasso');
             }
         };
-        window.addEventListener('keydown', onKey);
-        return () => window.removeEventListener('keydown', onKey);
-    }, []);
+    }, [is3DEraseMode, lassoMode]);
 
     // Toggle CT volume visibility based on segmentation-only mode
     useEffect(() => {
@@ -366,10 +504,17 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
         setLassoMode(false);
         setHasMeshes(false);
         setGeneratedOrganIds([]);
+        setActiveOrgans(new Set());
+        emitVisibleOrgans(null);
 
         // Clear existing volumes if any
         if (context.current) {
             const { renderer, renderWindow } = context.current;
+            meshActorsRef.current.forEach(a => {
+                try { renderer.removeActor(a); a.delete(); } catch { /* ignore */ }
+            });
+            meshActorsRef.current = [];
+            meshActorByIdRef.current = {};
             if (context.current.volume) {
                 renderer.removeVolume(context.current.volume);
                 context.current.volume.delete();
@@ -383,6 +528,11 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
             renderWindow.render();
         }
     }, [files]);
+
+    useEffect(() => {
+        applyAllOrganVisibility(activeOrgans);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [masks]);
 
     const updateTransferFunction = (currentActiveOrgans?: Set<string>) => {
         if (!context.current?.volume) return;
@@ -755,7 +905,8 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
                 maskImageDataRef.current?.modified();
                 context.current?.renderWindow?.render();
             } catch { /* ignore */ }
-            syncLabelMapTo2D(undoStackRef.current[undoStackRef.current.length - 1]);
+            syncLabelMapTo2D();
+            await rebuildMeshesFromLabelMapRef.current();
         }
         clearLassoCanvas();
         setLassoProcessing(false);
@@ -813,7 +964,10 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
         isErasingRef.current = false;
         didSnapshotStrokeRef.current = false;
         const previous = undoStackRef.current[undoStackRef.current.length - 1];
-        if (previous) syncLabelMapTo2D(previous);
+        if (previous) {
+            syncLabelMapTo2D();
+            rebuildMeshesFromLabelMapRef.current();
+        }
     };
 
     const generate3DVolume = async () => {
@@ -938,43 +1092,26 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
         // Remove previous mesh actors
         meshActorsRef.current.forEach(a => renderer.removeActor(a));
         meshActorsRef.current = [];
+        meshActorByIdRef.current = {};
 
-        // Helper: build VTK mesh actor from a pre-built binary Uint8Array
-        const buildMesh = async (binary: Uint8Array, r: number, g: number, b: number) => {
-            const maskImg = vtkImageData.newInstance();
-            maskImg.setDimensions([W, H, D]);
-            maskImg.setSpacing(spacing as [number, number, number]);
-            maskImg.setOrigin(origin as [number, number, number]);
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            maskImg.setDirection(direction as any);
-            const arr = vtkDataArray.newInstance({ name: 'scalars', values: binary, numberOfComponents: 1 });
-            maskImg.getPointData().setScalars(arr);
-
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const mc = (vtkImageMarchingCubes as any).newInstance({ contourValue: 0.5, computeNormals: true });
-            mc.setInputData(maskImg);
-
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const meshMapper = (vtkMapper as any).newInstance();
-            meshMapper.setInputConnection(mc.getOutputPort());
-
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const meshActor = (vtkActor as any).newInstance();
-            meshActor.setMapper(meshMapper);
-            meshActor.getProperty().setColor(r, g, b);
-            meshActor.getProperty().setOpacity(0.92);
-            meshActor.getProperty().setAmbient(0.3);
-            meshActor.getProperty().setDiffuse(0.7);
-            meshActor.getProperty().setSpecular(0.2);
-            renderer.addActor(meshActor);
+        // Helper: build a smoothed surface mesh from a binary mask
+        const buildMesh = async (id: string, binary: Uint8Array, r: number, g: number, b: number) => {
+            const meshActor = addSmoothedMeshActor(
+                renderer, binary, W, H, D,
+                spacing as [number, number, number],
+                origin as [number, number, number],
+                direction, r, g, b,
+            );
             meshActorsRef.current.push(meshActor);
+            meshActorByIdRef.current[id] = meshActor;
             await new Promise<void>(res => setTimeout(res, 0));
         };
 
         // 1. HU-based meshes — generate binary masks in a Web Worker to keep main thread free
         const ct = ctScalarsRef.current;
+        let huBinaries: { id: string; binary: Uint8Array }[] = [];
         if (huBasedOrgs.length > 0 && ct) {
-            const binaryResults = await new Promise<{ id: string; binary: Uint8Array }[]>((resolve) => {
+            huBinaries = await new Promise<{ id: string; binary: Uint8Array }[]>((resolve) => {
                 const worker = new Worker(
                     new URL('../workers/maskGenerator.worker.ts', import.meta.url),
                     { type: 'module' },
@@ -1006,7 +1143,7 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
                 });
             });
 
-            for (const { id, binary } of binaryResults) {
+            for (const { id, binary } of huBinaries) {
                 const org = huBasedOrgs.find(o => o.id === id);
                 if (!org) continue;
                 let hasVoxels = false;
@@ -1015,7 +1152,7 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
                 }
                 if (!hasVoxels) continue;
                 const [r, g, b] = org.color;
-                await buildMesh(binary, r, g, b);
+                await buildMesh(id, binary, r, g, b);
             }
         }
 
@@ -1027,7 +1164,7 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
                 binary[i] = labelMap![i] === mask.segmentIndex ? 1 : 0;
             }
             const [r, g, b] = [mask.color[0]/255, mask.color[1]/255, mask.color[2]/255];
-            await buildMesh(binary, r, g, b);
+            await buildMesh(mask.id, binary, r, g, b);
         }
 
         if (meshActorsRef.current.length === 0) {
@@ -1037,17 +1174,48 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
         }
 
         renderer.resetCamera();
+        if (context.current.volume) {
+            try { context.current.volume.setVisibility(false); } catch { /* ignore */ }
+        }
+
+        // Keep a full multi-label volume so 2D slice paint/erase updates one
+        // slice in place instead of replacing the entire 3D model.
+        const combined = new Uint8Array(totalVox);
+        if (localLabelMapRef.current && localLabelMapRef.current.length === totalVox) {
+            combined.set(localLabelMapRef.current);
+        }
+        for (const { id, binary } of huBinaries) {
+            const org = huBasedOrgs.find(o => o.id === id);
+            if (!org) continue;
+            const seg = org.segmentIndex;
+            for (let i = 0; i < totalVox; i++) {
+                if (binary[i]) combined[i] = seg;
+            }
+        }
+        localLabelMapRef.current = combined;
+        ensureMaskActorRef.current?.(
+            combined,
+            [W, H, D],
+            spacing as [number, number, number],
+            origin as [number, number, number],
+            direction,
+        );
+        if (context.current.maskVolume) {
+            try { context.current.maskVolume.setVisibility(false); } catch { /* ignore */ }
+        }
+
         renderWindow.render();
+        const generatedIds = Object.keys(meshActorByIdRef.current);
         setHasMeshes(true);
-        setGeneratedOrganIds(huBasedOrgs.map(o => o.id));
+        setGeneratedOrganIds(generatedIds);
+        setActiveOrgans(new Set(generatedIds));
+        emitVisibleOrgans(generatedIds);
+        applyMaskSegmentVisibility(new Set(generatedIds));
+        setSegOnlyMode(true);
         onGeneratingChange?.(false);
 
-        // Notify CornerstoneViewer to mirror the segmentation on the 2D slices
-        if (huBasedOrgs.length > 0) {
-            onSegmentationGenerated?.(
-                huBasedOrgs.map(o => ({ id: o.id, huMin: o.huMin, huMax: o.huMax }))
-            );
-        }
+        // 2D overlay must show the same labelmap as 3D so lasso/erase line up.
+        syncLabelMapTo2D();
     };
 
     // Expose generate to parent via generateRef
@@ -1057,6 +1225,55 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
     generateSurfaceMeshesRef.current = generateSurfaceMeshes;
     const generate3DVolumeRef = useRef(generate3DVolume);
     generate3DVolumeRef.current = generate3DVolume;
+
+    const rebuildMeshesFromLabelMap = async () => {
+        const meta = volumeMetadataRef.current;
+        const data = localLabelMapRef.current;
+        if (!meta || !data || !context.current) return;
+        const { origin, spacing, dimensions, direction } = meta;
+        const [W, H, D] = dimensions as [number, number, number];
+        const total = W * H * D;
+        if (data.length < total) return;
+        const { renderer, renderWindow } = context.current;
+        meshActorsRef.current.forEach(a => {
+            try { renderer.removeActor(a); } catch { /* ignore */ }
+        });
+        meshActorsRef.current = [];
+        meshActorByIdRef.current = {};
+
+        const visible = activeOrgansRef.current;
+        for (const org of organDefsRef.current) {
+            const binary = new Uint8Array(total);
+            let has = false;
+            for (let i = 0; i < total; i++) {
+                if (data[i] === org.segmentIndex) { binary[i] = 1; has = true; }
+            }
+            if (!has) continue;
+            const [r, g, b] = org.color;
+            const actor = addSmoothedMeshActor(
+                renderer, binary, W, H, D,
+                spacing as [number, number, number],
+                origin as [number, number, number],
+                direction, r, g, b,
+            );
+            try { actor.setVisibility(visible.size === 0 || visible.has(org.id)); } catch { /* ignore */ }
+            meshActorsRef.current.push(actor);
+            meshActorByIdRef.current[org.id] = actor;
+            await new Promise<void>(res => setTimeout(res, 0));
+        }
+        if (context.current.maskVolume) {
+            try { context.current.maskVolume.setVisibility(false); } catch { /* ignore */ }
+        }
+        renderWindow.render();
+    };
+    const rebuildMeshesFromLabelMapRef = useRef(rebuildMeshesFromLabelMap);
+    rebuildMeshesFromLabelMapRef.current = rebuildMeshesFromLabelMap;
+    const scheduleMeshRebuild = () => {
+        if (meshRebuildTimerRef.current) clearTimeout(meshRebuildTimerRef.current);
+        meshRebuildTimerRef.current = setTimeout(() => {
+            rebuildMeshesFromLabelMapRef.current();
+        }, 280);
+    };
 
     useEffect(() => {
         if (!generateRef) return;
@@ -1073,25 +1290,38 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
     const maskOfunRef  = useRef<ReturnType<typeof vtkPiecewiseFunction.newInstance> | null>(null);
 
     const buildMaskTransferFunctions = () => {
-        const seg: [number, number, number][] = [
-            [1.0, 0.82, 0.24], // 1 bone
-            [0.88, 0.47, 0.25], // 2 liver
-            [0.88, 0.25, 0.25], // 3 kidney
-            [0.31, 0.75, 1.00], // 4 lung
-            [0.63, 0.25, 0.80], // 5 spleen
-            [1.00, 0.40, 0.60], // 6 heart
-            [0.71, 0.86, 0.31], // 7 fat
-            [0.78, 0.31, 1.00], // 8 custom
-        ];
         const ctfun = vtkColorTransferFunction.newInstance();
         ctfun.addRGBPoint(0,   0, 0, 0);
         ctfun.addRGBPoint(0.9, 0, 0, 0);
-        seg.forEach(([r, g, b], i) => {
-            const idx = i + 1;
-            ctfun.addRGBPoint(idx - 0.1, r, g, b);
-            ctfun.addRGBPoint(idx,       r, g, b);
-            ctfun.addRGBPoint(idx + 0.9, r, g, b);
-        });
+        const masksNow = masksRef.current;
+        if (masksNow.length > 0) {
+            masksNow.forEach(m => {
+                const idx = m.segmentIndex;
+                const r = m.color[0] / 255;
+                const g = m.color[1] / 255;
+                const b = m.color[2] / 255;
+                ctfun.addRGBPoint(idx - 0.1, r, g, b);
+                ctfun.addRGBPoint(idx,       r, g, b);
+                ctfun.addRGBPoint(idx + 0.9, r, g, b);
+            });
+        } else {
+            const seg: [number, number, number][] = [
+                [1.00, 0.50, 0.60], // 1 bone
+                [0.88, 0.47, 0.25], // 2 liver
+                [0.88, 0.25, 0.25], // 3 kidney
+                [0.31, 0.75, 1.00], // 4 lung
+                [0.63, 0.25, 0.80], // 5 spleen
+                [1.00, 0.40, 0.60], // 6 heart
+                [0.71, 0.86, 0.31], // 7 fat
+                [0.78, 0.31, 1.00], // 8 custom
+            ];
+            seg.forEach(([r, g, b], i) => {
+                const idx = i + 1;
+                ctfun.addRGBPoint(idx - 0.1, r, g, b);
+                ctfun.addRGBPoint(idx,       r, g, b);
+                ctfun.addRGBPoint(idx + 0.9, r, g, b);
+            });
+        }
         const ofun = vtkPiecewiseFunction.newInstance();
         ofun.addPoint(0,   0);
         ofun.addPoint(0.9, 0);
@@ -1222,9 +1452,7 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
                 (maskScalarsRef.current as any).setData(values, 1);
                 maskScalarsRef.current.modified();
                 maskImageDataRef.current.modified();
-                meshActorsRef.current.forEach(a => {
-                    try { a.setVisibility(false); } catch { /* ignore */ }
-                });
+                try { context.current.maskVolume.setVisibility(false); } catch { /* ignore */ }
                 setHasLiveMask(true);
                 renderWindow.render();
                 return;
@@ -1270,6 +1498,7 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
 
         renderer.addVolume(maskActor);
         context.current.maskVolume = maskActor;
+        try { maskActor.setVisibility(false); } catch { /* ignore */ }
         setSegOnlyMode(true);
         setHasLiveMask(true);
 
@@ -1281,6 +1510,7 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
         }
         renderWindow.render();
     }, []);
+    ensureMaskActorRef.current = ensureMaskActor;
 
     const applySlicePaint = useCallback((info: SlicePaintInfo) => {
         if (!context.current) return;
@@ -1290,13 +1520,18 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
         const meta = volumeMetadataRef.current;
 
         if (meta) {
-            const { xyScale, origCols, origRows, zStep, dimensions } = meta;
+            const { xyScale, origCols, zStep, dimensions } = meta;
             const outCols   = dimensions[0] as number;
             const outRows   = dimensions[1] as number;
             const outSlices = dimensions[2] as number;
             const needed    = outCols * outRows * outSlices;
             if (!localLabelMapRef.current || localLabelMapRef.current.length !== needed) {
-                localLabelMapRef.current = new Uint8Array(needed);
+                const next = new Uint8Array(needed);
+                const prev = localLabelMapRef.current;
+                if (prev && prev.length > 0) {
+                    next.set(prev.subarray(0, Math.min(prev.length, needed)));
+                }
+                localLabelMapRef.current = next;
             }
             const buf = localLabelMapRef.current;
             const si  = Math.min(Math.floor(sliceIdx / Math.max(1, zStep)), outSlices - 1);
@@ -1318,12 +1553,18 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
                 meta.origin as [number, number, number],
                 meta.direction,
             );
+            scheduleMeshRebuild();
             return;
         }
 
         const count = width * height * numSlices;
         if (!localLabelMapRef.current || localLabelMapRef.current.length !== count) {
-            localLabelMapRef.current = new Uint8Array(count);
+            const next = new Uint8Array(count);
+            const prev = localLabelMapRef.current;
+            if (prev && prev.length > 0) {
+                next.set(prev.subarray(0, Math.min(prev.length, count)));
+            }
+            localLabelMapRef.current = next;
         }
         localLabelMapRef.current.set(pixelData, sliceIdx * width * height);
         ensureMaskActor(
@@ -1332,6 +1573,7 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
             [1, 1, 1],
             [0, 0, 0],
         );
+        scheduleMeshRebuild();
     }, [ensureMaskActor]);
 
     // Populate refreshLabelMapRef so CornerstoneViewer (or any caller) can push
@@ -1454,7 +1696,7 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
                         </svg>
                     </button>
                     {/* CT ↔ Segmentation view toggle (only useful when a mask exists) */}
-                    {context.current?.maskVolume && (
+                    {hasLiveMask && (
                         <button
                             onClick={() => setSegOnlyMode(v => !v)}
                             className={`px-3 py-2 rounded-lg border shadow-lg transition-colors text-xs font-semibold ${
@@ -1469,7 +1711,7 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
                     )}
 
                     {/* 3D tool: Move / Sphere erase / Lasso — exclusive, always clickable above overlays */}
-                    {context.current?.maskVolume && (
+                    {hasLiveMask && (
                         <>
                             <button
                                 onClick={() => setTool3D('move')}
@@ -1488,8 +1730,8 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
                                         ? 'bg-rose-700 hover:bg-rose-600 border-rose-500 text-white'
                                         : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300'
                                 }`}
-                                title="구형 지우개: 드래그로 노이즈 제거">
-                                🧹 구형 지우기
+                                title="구형 지우개 (Q)">
+                                🧹 구형 지우기 <span className="opacity-60">Q</span>
                             </button>
                             <button
                                 onClick={() => setTool3D(lassoMode ? 'move' : 'lasso')}
@@ -1498,8 +1740,8 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
                                         ? 'bg-orange-700 hover:bg-orange-600 border-orange-500 text-white'
                                         : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300'
                                 }`}
-                                title="올가미 지우기: 영역을 그려서 안쪽 제거">
-                                🔲 올가미 지우기
+                                title="올가미 지우기 (O)">
+                                🔲 올가미 지우기 <span className="opacity-60">O</span>
                             </button>
                             <button
                                 onClick={undo3DEdit}
@@ -1580,30 +1822,54 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
                 <div className="absolute bottom-4 left-4 z-10 w-64 bg-[#1a1a1a]/95 backdrop-blur border border-[#333] rounded-lg shadow-2xl overflow-hidden">
                     {/* Header */}
                     <div className="flex items-center justify-between px-3 py-2 border-b border-[#2a2a2a]">
-                        <span className="text-[11px] font-semibold text-slate-200">부위별 CT 세그멘테이션</span>
-                        {activeOrgans.size > 0 && (
-                            <button onClick={() => setActiveOrgans(new Set())}
-                                className="text-[9px] text-slate-500 hover:text-slate-300 bg-[#222] hover:bg-[#2a2a2a] px-1.5 py-0.5 rounded transition-colors">
-                                전체 해제
-                            </button>
-                        )}
+                        <span className="text-[11px] font-semibold text-slate-200">
+                            {hasMeshes ? '부위별 표시' : '부위별 CT 세그멘테이션'}
+                        </span>
+                        <div className="flex items-center gap-1">
+                            {hasMeshes && generatedOrganIds.length > 0 && (
+                                <button
+                                    onClick={() => {
+                                        const all = new Set(generatedOrganIds);
+                                        applyAllOrganVisibility(all);
+                                        setActiveOrgans(all);
+                                        emitVisibleOrgans([...all]);
+                                    }}
+                                    className="text-[9px] text-slate-500 hover:text-slate-300 bg-[#222] hover:bg-[#2a2a2a] px-1.5 py-0.5 rounded transition-colors">
+                                    전체
+                                </button>
+                            )}
+                            {activeOrgans.size > 0 && (
+                                <button onClick={() => {
+                                    applyAllOrganVisibility(new Set());
+                                    setActiveOrgans(new Set());
+                                    emitVisibleOrgans([]);
+                                }}
+                                    className="text-[9px] text-slate-500 hover:text-slate-300 bg-[#222] hover:bg-[#2a2a2a] px-1.5 py-0.5 rounded transition-colors">
+                                    해제
+                                </button>
+                            )}
+                        </div>
                     </div>
 
                     {/* Organ toggle grid */}
                     <div className="p-2 grid grid-cols-4 gap-1">
                         {organDefs.map(org => {
                             const isActive = activeOrgans.has(org.id);
+                            const generated = generatedOrganIds.includes(org.id);
                             return (
                                 <button key={org.id} onClick={() => toggleOrgan(org.id)}
                                     className={`flex flex-col items-center py-1.5 px-1 rounded text-[9px] font-semibold transition-all border ${
                                         isActive
                                             ? 'border-transparent text-slate-900'
-                                            : 'border-[#333] text-slate-500 hover:text-slate-300 hover:border-slate-600 bg-[#111]'
+                                            : generated
+                                                ? 'border-[#444] text-slate-400 hover:text-slate-200 hover:border-slate-500 bg-[#111]'
+                                                : 'border-[#333] text-slate-500 hover:text-slate-300 hover:border-slate-600 bg-[#111]'
                                     }`}
                                     style={isActive ? { backgroundColor: org.colorCss, borderColor: org.colorCss } : {}}>
                                     <span className="w-3 h-3 rounded-full mb-0.5 shrink-0"
                                         style={{ backgroundColor: org.colorCss,
-                                                 boxShadow: isActive ? `0 0 5px ${org.colorCss}` : 'none' }} />
+                                                 boxShadow: isActive ? `0 0 5px ${org.colorCss}` : 'none',
+                                                 opacity: hasMeshes && !generated && !isActive ? 0.4 : 1 }} />
                                     {org.label.split(' ')[0]}
                                 </button>
                             );
@@ -1663,11 +1929,15 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
                             className="w-full py-1.5 rounded text-[11px] font-semibold bg-emerald-700 hover:bg-emerald-600 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
                             ⬡ Generate Model
                         </button>
-                        {activeOrgans.size === 0 && (
+                        {hasMeshes ? (
+                            <p className="text-[9px] text-slate-500 text-center mt-1">
+                                위 버튼을 눌러 부위별로 켜고 끄세요
+                            </p>
+                        ) : activeOrgans.size === 0 ? (
                             <p className="text-[9px] text-slate-600 text-center mt-1">
                                 우측 레이어에서 체크한 부위만 생성됩니다
                             </p>
-                        )}
+                        ) : null}
                     </div>
                 </div>
             )}

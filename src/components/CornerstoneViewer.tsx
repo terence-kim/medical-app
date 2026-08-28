@@ -74,17 +74,23 @@ const TISSUE_TYPES: TissueType[] = [
 const SEG_LUT_SIZE = 16;
 
 /** Build an RGBA LUT from the current mask list + opacity (0-1). */
-function buildSegLut(masks: { segmentIndex: number; color: [number, number, number]; visible?: boolean }[], opacity: number): Uint8Array {
+function buildSegLut(
+    masks: { id?: string; segmentIndex: number; color: [number, number, number]; visible?: boolean }[],
+    opacity: number,
+    visibleIds?: string[],
+): Uint8Array {
     const lut = new Uint8Array(SEG_LUT_SIZE * 4);
     const alpha = Math.round(Math.min(1, Math.max(0, opacity)) * 255);
+    const allow = visibleIds ? new Set(visibleIds) : null;
     for (const m of masks) {
         const o = m.segmentIndex * 4;
-        if (o + 3 < lut.length && m.visible !== false) {
-            lut[o]     = m.color[0];
-            lut[o + 1] = m.color[1];
-            lut[o + 2] = m.color[2];
-            lut[o + 3] = alpha;
-        }
+        if (o + 3 >= lut.length) continue;
+        const selected = allow === null || (m.id != null && allow.has(m.id));
+        if (!selected || m.visible === false) continue;
+        lut[o]     = m.color[0];
+        lut[o + 1] = m.color[1];
+        lut[o + 2] = m.color[2];
+        lut[o + 3] = alpha;
     }
     return lut;
 }
@@ -109,6 +115,8 @@ interface CornerstoneViewerProps {
     files?:          File[] | null;
     /** Named mask definitions — drives overlay colors and segment indices */
     masks?:          Mask[];
+    /** Only these mask IDs are drawn on the 2D overlay (checkbox / 3D category selection) */
+    visibleMaskIds?: string[];
     /** ID of the mask currently being painted */
     activeMaskId?:   string;
     /** 'draw' = brush, 'erase' = eraser */
@@ -162,6 +170,7 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
         colorCss: t.colorCss, visible: true, locked: false,
         segmentIndex: t.segmentIndex, huMin: t.huMin, huMax: t.huMax,
     }));
+    const visibleMaskIds = props.visibleMaskIds;
     const activeMaskId  = props.activeMaskId ?? 'bone';
     const activeMask    = extMasks.find(m => m.id === activeMaskId) ?? extMasks[0];
     // Map external brushMode → internal activeTool
@@ -206,7 +215,7 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     const renderSegOverlayRef   = useRef<() => void>(() => {});
 
     // Dynamic colour LUT — rebuilt from extMasks + overlayOpacity on every render
-    const segLutRef         = useRef<Uint8Array>(buildSegLut(extMasks, 0.78));
+    const segLutRef         = useRef<Uint8Array>(buildSegLut(extMasks, 0.78, visibleMaskIds));
     // Cursor tracking refs (read inside renderCursor, a stable useCallback)
     const activeToolRef     = useRef(activeTool);
     const brushSizeRef      = useRef(brushSize);
@@ -214,9 +223,6 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     const mousePageXRef     = useRef(0);
     const mousePageYRef     = useRef(0);
     const mouseOnElRef      = useRef(false);
-
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    const auto3DTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); // kept for legacy refs
 
     // Performance-critical refs for renderSegOverlay
     // imgDataRef: reused ImageData buffer — avoids 1 MB allocation per frame
@@ -515,6 +521,16 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             else if (e.key === 'ArrowUp'    || e.key === 'ArrowLeft')  { e.preventDefault(); navigateSlice(-1); }
             else if (e.key === 'PageDown')                              { e.preventDefault(); navigateSlice(5);  }
             else if (e.key === 'PageUp')                                { e.preventDefault(); navigateSlice(-5); }
+            else if (e.key === 'w' || e.key === 'W' || e.key === 'l' || e.key === 'L') {
+                e.preventDefault();
+                setActiveTool('Wwwc');
+            } else if (e.key === '[') {
+                e.preventDefault();
+                setBrushSize(s => Math.max(1, s - 2));
+            } else if (e.key === ']') {
+                e.preventDefault();
+                setBrushSize(s => Math.min(80, s + 2));
+            }
         };
         window.addEventListener('keydown', handle);
         return () => window.removeEventListener('keydown', handle);
@@ -977,15 +993,16 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     activeToolRef.current        = activeTool;
     brushSizeRef.current         = brushSize;
     overlayOpacityRef.current    = overlayOpacity;
-    // Rebuild LUT whenever masks or opacity changes
-    segLutRef.current            = buildSegLut(extMasks, overlayOpacity);
+    // Rebuild LUT whenever masks, opacity, or the visible-segment selection changes
+    segLutRef.current            = buildSegLut(extMasks, overlayOpacity, visibleMaskIds);
 
-    // Re-render overlay when active mask, HU range, or gate preview state changes
+    // Re-render overlay when active mask, HU range, gate preview, or visible segments change
+    const visibleMaskKey = (visibleMaskIds ?? []).join(',');
+    const masksVisKey = extMasks.map(m => `${m.id}:${m.visible !== false}`).join('|');
     useEffect(() => {
-        // Clear HU preview cache so the next render recomputes for the current slice
         huPreviewCacheRef.current = null;
         renderSegOverlayRef.current?.();
-    }, [activeMaskId, brushHuMin, brushHuMax, props.gatePreviewActive]);
+    }, [activeMaskId, brushHuMin, brushHuMax, props.gatePreviewActive, visibleMaskKey, masksVisKey]);
 
     // ── Fill-current-slice with HU threshold ─────────────────────────────────
     // One-shot: paints every pixel in the current 2D slice that falls within the
@@ -1252,9 +1269,8 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
         renderSegOverlayRef.current?.();
     }, [isReady, isCT]);
 
-    // Push a 3D labelmap (after lasso / sphere erase / undo) onto each 2D slice.
-    // Where the 3D voxel is 0, matching 2D pixels are cleared. Non-zero 3D voxels
-    // are left alone in 2D so higher-resolution brush strokes are preserved.
+    // Push a 3D labelmap (after generate / lasso / sphere erase / undo) onto each 2D slice.
+    // 2D overlay is a display of the 3D volume so lasso/erase lands on the same anatomy.
     const apply3DLabelMap = useCallback((info: {
         data: Uint8Array;
         volW: number; volH: number; volD: number;
@@ -1263,7 +1279,7 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     }) => {
         const element = elementRef.current;
         if (!element || !isReady) return;
-        const { data, volW, volH, volD, xyScale, zStep, previous } = info;
+        const { data, volW, volH, volD, zStep } = info;
         if (!data || volW <= 0 || volH <= 0 || volD <= 0) return;
 
         let w = 0, h = 0;
@@ -1272,12 +1288,11 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             if (image) { w = image.width; h = image.height; }
         } catch { /* ignore */ }
         if (w === 0 || h === 0) {
-            w = volW * Math.max(1, xyScale);
-            h = volH * Math.max(1, xyScale);
+            w = volW * Math.max(1, info.xyScale);
+            h = volH * Math.max(1, info.xyScale);
         }
 
         const numSlices = totalImagesRef.current;
-        const sx = Math.max(1, xyScale);
         const sz = Math.max(1, zStep);
 
         for (let i = 0; i < numSlices; i++) {
@@ -1286,19 +1301,12 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             const si = Math.min(Math.floor(i / sz), volD - 1);
             const volBase = si * volW * volH;
             for (let r = 0; r < h; r++) {
-                const vr = Math.min(Math.floor(r / sx), volH - 1);
+                const vr = Math.min(Math.floor(r * volH / h), volH - 1);
                 const rowBase = volBase + vr * volW;
                 const dstRow = r * w;
                 for (let c = 0; c < w; c++) {
-                    const vc = Math.min(Math.floor(c / sx), volW - 1);
-                    const vi = rowBase + vc;
-                    const now = data[vi];
-                    if (previous) {
-                        if (previous[vi] === now) continue;
-                        pd[dstRow + c] = now;
-                    } else if (now === 0 && pd[dstRow + c] !== 0) {
-                        pd[dstRow + c] = 0;
-                    }
+                    const vc = Math.min(Math.floor(c * volW / w), volW - 1);
+                    pd[dstRow + c] = data[rowBase + vc] ?? 0;
                 }
             }
         }

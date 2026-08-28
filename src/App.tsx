@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback } from 'react'
+import { useRef, useState, useCallback, useEffect } from 'react'
 import VTKViewer from './components/VTKViewer'
 import CornerstoneViewer, { type DicomMetadata } from './components/CornerstoneViewer'
 import MPRViewer from './components/MPRViewer'
@@ -21,7 +21,17 @@ function App() {
   const [masks,          setMasks]          = useState<Mask[]>(DEFAULT_MASKS);
   const [activeMaskId,   setActiveMaskId]   = useState<string>('bone');
   /** Layers checked in MaskPanel — Generate 3D uses only these */
-  const [selectedMaskIds, setSelectedMaskIds] = useState<string[]>(['bone']);
+  const [selectedMaskIds, setSelectedMaskIds] = useState<string[]>(
+    DEFAULT_MASKS.filter(m => m.id !== 'custom').map(m => m.id),
+  );
+  /** 3D 부위 패널에서 켜 둔 장기. null이면 아직 Generate 전 → 우측 체크 레이어를 따름 */
+  const [visibleOrganIds, setVisibleOrganIds] = useState<string[] | null>(null);
+  const [segOverlayOn, setSegOverlayOn] = useState(true);
+  const [showShortcuts, setShowShortcuts] = useState(false);
+  const overlayMaskIds = (visibleOrganIds ?? selectedMaskIds).filter(id => {
+    if (!segOverlayOn) return false;
+    return masks.find(m => m.id === id)?.visible !== false;
+  });
   const [brushMode,      setBrushMode]      = useState<'draw' | 'erase'>('draw');
   // Incremented every time Draw or Erase is clicked in MaskPanel, so
   // CornerstoneViewer's useEffect always fires (even if mode doesn't change).
@@ -84,6 +94,45 @@ function App() {
     setBrushHuMax(max);
   }, []);
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const k = e.key.toLowerCase();
+      if (k === 'b') {
+        e.preventDefault();
+        setBrushMode('draw');
+        setBrushModeTick(t => t + 1);
+      } else if (k === 'e') {
+        e.preventDefault();
+        setBrushMode('erase');
+        setBrushModeTick(t => t + 1);
+      } else if (k === 'h') {
+        e.preventDefault();
+        setSegOverlayOn(v => !v);
+      } else if (k === 's') {
+        e.preventDefault();
+        setGatePreviewActive(v => !v);
+      } else if (k === 'g') {
+        e.preventDefault();
+        if (!isGenerating) vtkGenerateRef.current?.();
+      } else if (k === '?' || (e.shiftKey && k === '/')) {
+        e.preventDefault();
+        setShowShortcuts(v => !v);
+      } else if (k >= '1' && k <= '8') {
+        e.preventDefault();
+        const idx = Number(k) - 1;
+        setMasks(prev => {
+          if (!prev[idx]) return prev;
+          return prev.map((m, i) => i === idx ? { ...m, visible: !m.visible } : m);
+        });
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isGenerating]);
+
   // ── Toast ─────────────────────────────────────────────────────────────────
   const showToast = (message: string) => {
     setToast(message);
@@ -102,6 +151,7 @@ function App() {
       if (candidateFiles.length > 0) {
         setSelectedFiles(candidateFiles);
         setCaseMeta(null);
+        setVisibleOrganIds(null);
       } else {
         showToast('선택한 폴더/파일에서 사용 가능한 DICOM 파일을 찾지 못했습니다.');
       }
@@ -169,12 +219,22 @@ function App() {
         <div className="w-px h-5 bg-[#2d2d50]" />
 
         {/* Quick tool shortcuts */}
-        {(['Zoom (Z)', 'Levels (L)', 'Pan (P)'] as const).map(label => (
-          <button key={label}
-            className="px-2 py-1 rounded text-[11px] text-slate-400 hover:bg-[#1e1e38] hover:text-slate-200 transition-colors">
-            {label}
-          </button>
-        ))}
+        <button onClick={() => { setBrushMode('draw'); setBrushModeTick(t => t + 1); }}
+          className={`px-2 py-1 rounded text-[11px] transition-colors ${brushMode === 'draw' ? 'bg-sky-800 text-white' : 'text-slate-400 hover:bg-[#1e1e38] hover:text-slate-200'}`}>
+          Draw (B)
+        </button>
+        <button onClick={() => { setBrushMode('erase'); setBrushModeTick(t => t + 1); }}
+          className={`px-2 py-1 rounded text-[11px] transition-colors ${brushMode === 'erase' ? 'bg-rose-800 text-white' : 'text-slate-400 hover:bg-[#1e1e38] hover:text-slate-200'}`}>
+          Erase (E)
+        </button>
+        <button onClick={() => setSegOverlayOn(v => !v)}
+          className={`px-2 py-1 rounded text-[11px] transition-colors ${segOverlayOn ? 'bg-sky-800 text-white' : 'text-slate-500 hover:bg-[#1e1e38]'}`}>
+          Overlay (H)
+        </button>
+        <button onClick={() => setShowShortcuts(v => !v)}
+          className="px-2 py-1 rounded text-[11px] text-slate-400 hover:bg-[#1e1e38] hover:text-slate-200 transition-colors">
+          ? 단축키
+        </button>
 
         <div className="w-px h-5 bg-[#2d2d50]" />
 
@@ -226,6 +286,7 @@ function App() {
                 <CornerstoneViewer
                   files={selectedFiles}
                   masks={masks}
+                  visibleMaskIds={overlayMaskIds}
                   activeMaskId={activeMaskId}
                   brushMode={brushMode}
                   brushModeTick={brushModeTick}
@@ -257,10 +318,7 @@ function App() {
                     generateRef={vtkGenerateRef}
                     refreshLabelMapRef={vtkRefreshLabelMapRef}
                     refreshSliceRef={vtkRefreshSliceRef}
-                    onSegmentationGenerated={async (organs) => {
-                      await csViewerRef.current?.applyOrgansSegmentation(organs);
-                      csViewerRef.current?.sendTo3D();
-                    }}
+                    onVisibleOrgansChange={setVisibleOrganIds}
                     on3DLabelMapEdited={(info) => {
                       csViewerRef.current?.apply3DLabelMap(info);
                     }}
@@ -304,6 +362,7 @@ function App() {
                 <CornerstoneViewer
                   files={selectedFiles}
                   masks={masks}
+                  visibleMaskIds={overlayMaskIds}
                   activeMaskId={activeMaskId}
                   brushMode={brushMode}
                   brushModeTick={brushModeTick}
@@ -375,10 +434,7 @@ function App() {
                   generateRef={vtkGenerateRef}
                   refreshLabelMapRef={vtkRefreshLabelMapRef}
                   refreshSliceRef={vtkRefreshSliceRef}
-                  onSegmentationGenerated={async (organs) => {
-                    await csViewerRef.current?.applyOrgansSegmentation(organs);
-                    csViewerRef.current?.sendTo3D();
-                  }}
+                  onVisibleOrgansChange={setVisibleOrganIds}
                   on3DLabelMapEdited={(info) => {
                     csViewerRef.current?.apply3DLabelMap(info);
                   }}
@@ -414,6 +470,8 @@ function App() {
           onFillCurrentSlice={() => csViewerRef.current?.fillCurrentSlice()}
           onFillAllSlices={() => csViewerRef.current?.fillAllSlices()}
           onSendTo3D={() => csViewerRef.current?.sendTo3D()}
+          overlayOn={segOverlayOn}
+          onOverlayToggle={() => setSegOverlayOn(v => !v)}
         />
       </div>
 
@@ -421,6 +479,33 @@ function App() {
       {toast && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-[#1e1e1e] border border-[#444] text-slate-100 text-sm px-4 py-2 rounded-lg shadow-2xl max-w-md text-center">
           {toast}
+        </div>
+      )}
+
+      {showShortcuts && (
+        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center" onClick={() => setShowShortcuts(false)}>
+          <div className="bg-[#16162a] border border-[#3a3a60] rounded-xl p-5 w-[420px] shadow-2xl text-sm" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-3">
+              <span className="font-bold text-white">단축키</span>
+              <button onClick={() => setShowShortcuts(false)} className="text-slate-500 hover:text-white">✕</button>
+            </div>
+            <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[12px] text-slate-300">
+              <span className="text-slate-500">B</span><span>그리기</span>
+              <span className="text-slate-500">E</span><span>지우개</span>
+              <span className="text-slate-500">W / L</span><span>Window/Level</span>
+              <span className="text-slate-500">H</span><span>2D 세그먼트 숨김/표시</span>
+              <span className="text-slate-500">1–8</span><span>레이어별 숨김/표시</span>
+              <span className="text-slate-500">S</span><span>Smart Brush</span>
+              <span className="text-slate-500">G</span><span>Generate 3D</span>
+              <span className="text-slate-500">[ / ]</span><span>브러시 크기</span>
+              <span className="text-slate-500">← → ↑ ↓</span><span>슬라이스 이동</span>
+              <span className="text-slate-500">Q</span><span>3D 구형 지우기</span>
+              <span className="text-slate-500">O</span><span>3D 올가미 지우기</span>
+              <span className="text-slate-500">Esc</span><span>3D 이동 모드</span>
+              <span className="text-slate-500">Ctrl+Z</span><span>3D 실행취소</span>
+              <span className="text-slate-500">?</span><span>이 도움말</span>
+            </div>
+          </div>
         </div>
       )}
     </div>

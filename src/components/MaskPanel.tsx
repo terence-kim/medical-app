@@ -24,6 +24,8 @@ interface MaskPanelProps {
     onFillCurrentSlice:  () => void;
     onFillAllSlices:     () => void;
     onSendTo3D:          () => void;
+    overlayOn?:          boolean;
+    onOverlayToggle?:    () => void;
 }
 
 // Predefined segment presets
@@ -43,6 +45,7 @@ export default function MaskPanel({
     isCT, fillProgress, isGenerating, gatePreviewActive, onGatePreviewChange,
     onMasksChange, onActiveMaskChange, onBrushModeChange,
     onBrushHuChange, onGenerateModel, onSendTo3D,
+    overlayOn = true, onOverlayToggle,
 }: MaskPanelProps) {
     const [showAddMenu, setShowAddMenu] = useState(false);
     const [editingId,   setEditingId]   = useState<string | null>(null);
@@ -120,6 +123,16 @@ export default function MaskPanel({
                     <span className="text-[9px] text-slate-500">Segmentation</span>
                 </div>
                 <div className="flex-1" />
+                <button
+                    onClick={onOverlayToggle}
+                    className={`text-[9px] px-1.5 py-0.5 rounded border ${
+                        overlayOn
+                            ? 'text-sky-300 border-sky-700 bg-sky-900/30'
+                            : 'text-slate-600 border-[#3a3a60] bg-[#1a1a30]'
+                    }`}
+                    title="2D 세그먼트 오버레이 숨김/표시 (H)">
+                    {overlayOn ? '눈 H' : '숨김 H'}
+                </button>
                 <div className="flex items-center gap-1 mr-2">
                     <button
                         onClick={selectAllForGenerate}
@@ -263,7 +276,7 @@ export default function MaskPanel({
                                 <button
                                     onClick={e => { e.stopPropagation(); toggleVisibility(mask.id); }}
                                     className={`w-6 h-6 flex items-center justify-center rounded transition-colors hover:bg-[#3a3a60] ${mask.visible ? 'text-slate-300' : 'text-slate-700'}`}
-                                    title={mask.visible ? '숨기기' : '보이기'}>
+                                    title={mask.visible ? `2D에서 숨기기 (${idx + 1})` : `2D에서 보이기 (${idx + 1})`}>
                                     {mask.visible
                                         ? <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
                                         : <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
@@ -290,7 +303,7 @@ export default function MaskPanel({
                     className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-[12px] font-bold bg-gradient-to-r from-emerald-700 to-teal-700 hover:from-emerald-600 hover:to-teal-600 text-white transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-lg">
                     {isGenerating
                         ? <><span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" /> 3D 생성 중…</>
-                        : <><span className="text-base">⬡</span> Generate 3D Model{selectedMaskIds.length > 0 ? ` (${selectedMaskIds.length})` : ''}</>
+                        : <><span className="text-base">⬡</span> Generate 3D Model{selectedMaskIds.length > 0 ? ` (${selectedMaskIds.length})` : ''} <span className="text-[9px] font-normal opacity-70">G</span></>
                     }
                 </button>
                 {selectedMaskIds.length === 0 ? (
@@ -340,7 +353,7 @@ export default function MaskPanel({
                             <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
                                 <path d="M20.71 7.04a1 1 0 000-1.41l-2.34-2.34a1 1 0 00-1.41 0l-1.84 1.83 3.75 3.75M3 17.25V21h3.75L17.81 9.93l-3.75-3.75L3 17.25z"/>
                             </svg>
-                            Draw
+                            Draw <span className="text-[8px] opacity-70">B</span>
                         </button>
                         <button
                             onClick={() => onBrushModeChange('erase')}
@@ -352,7 +365,7 @@ export default function MaskPanel({
                             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                 <path d="M20 20H7L3 16l11-11 6 6-4 4"/><path d="M6 10l8 8"/>
                             </svg>
-                            Erase
+                            Erase <span className="text-[8px] opacity-70">E</span>
                         </button>
                     </div>
 
