@@ -1,9 +1,10 @@
 import { useRef, useState, useCallback, useEffect } from 'react'
 import VTKViewer from './components/VTKViewer'
-import CornerstoneViewer, { type DicomMetadata } from './components/CornerstoneViewer'
+import CornerstoneViewer, { type DicomMetadata, type MeasItem } from './components/CornerstoneViewer'
 import MPRViewer from './components/MPRViewer'
 import MPRSinglePane from './components/MPRSinglePane'
 import MaskPanel from './components/MaskPanel'
+import FindingsPanel from './components/FindingsPanel'
 import { DEFAULT_MASKS, type Mask } from './types/mask'
 import { useMPRVolume } from './hooks/useMPRVolume'
 import './App.css'
@@ -42,6 +43,10 @@ function App() {
   const [isGenerating,   setIsGenerating]   = useState(false);
   // Smart Brush: ON = paint only HU-matching pixels INSIDE the brush circle.
   const [gatePreviewActive, setGatePreviewActive] = useState(true);
+  // Findings panel
+  const [measItems,      setMeasItems]      = useState<MeasItem[]>([]);
+  const [findingsPanelOpen, setFindingsPanelOpen] = useState(false);
+  const [currentSlice,   setCurrentSlice]   = useState(0);
 
   // ── MPR shared volume (quad layout) ──────────────────────────────────────
   // Loaded lazily: only when quad mode is activated
@@ -51,7 +56,6 @@ function App() {
   const [axialSliceIdx, setAxialSliceIdx] = useState(0);
 
   // ── VTK / 3D ──────────────────────────────────────────────────────────────
-  // generateRef: parent calls ref.current() to trigger 3D generation in VTKViewer
   const vtkGenerateRef      = useRef<(() => void) | null>(null);
   // refreshLabelMapRef: VTKViewer populates this; CornerstoneViewer calls it to push
   // the labelmap directly (zero React-state copy)
@@ -238,10 +242,6 @@ function App() {
 
         <div className="w-px h-5 bg-[#2d2d50]" />
 
-        {/* Segment+ button */}
-        <button className="flex items-center gap-1 px-2.5 py-1 rounded text-[11px] font-semibold text-sky-300 border border-sky-700 hover:bg-sky-900/30 transition-colors">
-          Segment+
-        </button>
 
         {/* Patient info */}
         {patientInfo && (
@@ -266,6 +266,7 @@ function App() {
           <button className="px-2.5 py-0.5 rounded text-[11px] bg-sky-700 text-white font-semibold">Segments</button>
         </div>
       </header>
+
 
       {/* ── Main content ──────────────────────────────────────────────────── */}
       <div className="flex flex-1 min-h-0">
@@ -299,6 +300,8 @@ function App() {
                   vtkRefreshLabelMapRef={vtkRefreshLabelMapRef}
                   vtkRefreshSliceRef={vtkRefreshSliceRef}
                   imperativeRef={csViewerRef}
+                  onMeasItemsChange={setMeasItems}
+                  onSliceChange={setCurrentSlice}
                 />
               </div>
             </div>
@@ -445,6 +448,35 @@ function App() {
                 </div>
               )}
             </div>
+          </div>
+        )}
+
+        {/* Right: Findings panel (collapsible, above MaskPanel) */}
+        {selectedFiles && (
+          <div className={`shrink-0 border-l border-[#2d2d50] flex flex-col transition-all duration-200 ${findingsPanelOpen ? 'w-52' : 'w-7'}`}>
+            <button
+              onClick={() => setFindingsPanelOpen(v => !v)}
+              className="shrink-0 h-7 flex items-center justify-center text-[10px] text-slate-500 hover:text-sky-400 hover:bg-[#1e1e38] transition-colors border-b border-[#2d2d50]"
+              title={findingsPanelOpen ? '소견 패널 닫기' : '소견/측정 패널 열기'}>
+              {findingsPanelOpen
+                ? <><span className="text-[9px]">🏥</span><span className="ml-1 text-[9px]">▶</span></>
+                : <><span style={{ writingMode: 'vertical-rl', fontSize: 9 }}>🏥 소견</span></>
+              }
+              {measItems.length > 0 && !findingsPanelOpen && (
+                <span className="absolute top-0.5 right-0.5 w-1.5 h-1.5 bg-sky-500 rounded-full" />
+              )}
+            </button>
+            {findingsPanelOpen && (
+              <div className="flex-1 min-h-0 overflow-hidden">
+                <FindingsPanel
+                  measItems={measItems}
+                  totalSlices={selectedFiles.length}
+                  currentSlice={currentSlice}
+                  onClearMeasurements={() => csViewerRef.current?.clearMeasurements()}
+                  onJumpToSlice={() => {}}
+                />
+              </div>
+            )}
           </div>
         )}
 

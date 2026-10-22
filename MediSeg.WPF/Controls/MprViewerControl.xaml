@@ -1,0 +1,69 @@
+<UserControl x:Class="MediSeg.WPF.Controls.MprViewerControl"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Background="Black">
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- Axial -->
+        <Grid Grid.Column="0">
+            <Image x:Name="AxialImage" Stretch="Uniform"
+                   RenderOptions.BitmapScalingMode="HighQuality"/>
+            <Border VerticalAlignment="Top" HorizontalAlignment="Left"
+                    Background="#aa1e1e38" CornerRadius="0,0,4,0" Padding="6,3">
+                <TextBlock Text="AXIAL" Foreground="#60a5fa"
+                           FontWeight="Bold" FontSize="10"/>
+            </Border>
+            <Canvas x:Name="AxialCanvas" Background="Transparent"
+                    MouseWheel="Axial_MouseWheel"/>
+            <Border VerticalAlignment="Bottom" HorizontalAlignment="Right"
+                    Background="#aa0d0d1a" CornerRadius="4,0,0,0" Padding="6,3">
+                <TextBlock x:Name="AxialSliceLabel" Text="--"
+                           Foreground="#475569" FontSize="9" FontFamily="Consolas"/>
+            </Border>
+        </Grid>
+
+        <!-- Sagittal -->
+        <Grid Grid.Column="1">
+            <Image x:Name="SagittalImage" Stretch="Uniform"
+                   RenderOptions.BitmapScalingMode="HighQuality"/>
+            <Border VerticalAlignment="Top" HorizontalAlignment="Left"
+                    Background="#aa1e1e38" CornerRadius="0,0,4,0" Padding="6,3">
+                <TextBlock Text="SAGITTAL" Foreground="#22c55e"
+                           FontWeight="Bold" FontSize="10"/>
+            </Border>
+            <Canvas x:Name="SagittalCanvas" Background="Transparent"
+                    MouseWheel="Sagittal_MouseWheel"/>
+        </Grid>
+
+        <!-- Coronal -->
+        <Grid Grid.Column="2">
+            <Image x:Name="CoronalImage" Stretch="Uniform"
+                   RenderOptions.BitmapScalingMode="HighQuality"/>
+            <Border VerticalAlignment="Top" HorizontalAlignment="Left"
+                    Background="#aa1e1e38" CornerRadius="0,0,4,0" Padding="6,3">
+                <TextBlock Text="CORONAL" Foreground="#f97316"
+                           FontWeight="Bold" FontSize="10"/>
+            </Border>
+            <Canvas x:Name="CoronalCanvas" Background="Transparent"
+                    MouseWheel="Coronal_MouseWheel"/>
+        </Grid>
+
+        <!-- 로딩 오버레이 -->
+        <Grid x:Name="MprLoading" Grid.ColumnSpan="3" Visibility="Collapsed">
+            <Rectangle Fill="#cc000000"/>
+            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                <TextBlock Text="볼륨 로딩 중..." Foreground="#94a3b8"
+                           HorizontalAlignment="Center" FontSize="13"/>
+                <ProgressBar x:Name="MprProgressBar" Width="240" Height="4"
+                             Minimum="0" Maximum="100"
+                             Foreground="#3b82f6" Background="#1e1e38"
+                             Margin="0,10,0,0"/>
+            </StackPanel>
+        </Grid>
+    </Grid>
+</UserControl>

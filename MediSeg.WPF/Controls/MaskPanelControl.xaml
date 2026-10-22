@@ -1,0 +1,213 @@
+<UserControl x:Class="MediSeg.WPF.Controls.MaskPanelControl"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Width="220"
+             Background="#0f0f1f">
+    <DockPanel LastChildFill="True">
+
+        <!-- 패널 헤더 -->
+        <Border DockPanel.Dock="Top"
+                Background="#16162a" BorderBrush="#2d2d50" BorderThickness="0,0,0,1"
+                Padding="10,8">
+            <TextBlock Text="Segmentation" Foreground="#60a5fa"
+                       FontWeight="SemiBold" FontSize="12"/>
+        </Border>
+
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel Margin="8">
+
+                <!-- ── 마스크 목록 ────────────────────────────────── -->
+                <TextBlock Text="MASKS" Foreground="#475569" FontSize="9"
+                           FontWeight="Bold" Margin="2,4,0,4"/>
+
+                <ItemsControl x:Name="MaskList">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Grid Margin="0,1">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+
+                                <!-- 선택 체크박스 -->
+                                <CheckBox Grid.Column="0"
+                                          IsChecked="{Binding IsSelected, Mode=TwoWay}"
+                                          Margin="0,0,4,0" VerticalAlignment="Center"/>
+
+                                <!-- 색상 스와치 -->
+                                <Rectangle Grid.Column="1" Width="12" Height="12"
+                                           RadiusX="2" RadiusY="2"
+                                           Fill="{Binding ColorBrush}"
+                                           Margin="0,0,5,0" VerticalAlignment="Center"/>
+
+                                <!-- 레이블 버튼 (활성화 선택) -->
+                                <Button Grid.Column="2"
+                                        Content="{Binding Label}"
+                                        Click="MaskButton_Click"
+                                        Tag="{Binding Id}"
+                                        HorizontalContentAlignment="Left"
+                                        Background="Transparent" BorderThickness="0"
+                                        Foreground="{Binding LabelColor}"
+                                        FontSize="11" Padding="2,4"
+                                        Cursor="Hand"/>
+
+                                <!-- 가시성 토글 -->
+                                <ToggleButton Grid.Column="3"
+                                             IsChecked="{Binding Mask.Visible, Mode=TwoWay}"
+                                             Width="18" Height="18"
+                                             Background="Transparent" BorderThickness="0"
+                                             Content="👁" FontSize="9"
+                                             ToolTip="표시/숨기기"
+                                             Click="VisibilityToggle_Click"/>
+                            </Grid>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+
+                <Separator Margin="0,8" Background="#2d2d50"/>
+
+                <!-- ── HU Range 슬라이더 ─────────────────────────── -->
+                <TextBlock Text="HU RANGE" Foreground="#475569" FontSize="9"
+                           FontWeight="Bold" Margin="2,0,0,4"/>
+
+                <Grid Margin="0,0,0,4">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel>
+                        <TextBlock Text="Min" Foreground="#64748b" FontSize="9"/>
+                        <TextBox x:Name="HuMinBox" Text="400"
+                                 Background="#1e1e38" Foreground="White"
+                                 BorderBrush="#3a3a60" FontSize="11"
+                                 Padding="4,3" TextChanged="HuRange_Changed"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Margin="4,0,0,0">
+                        <TextBlock Text="Max" Foreground="#64748b" FontSize="9"/>
+                        <TextBox x:Name="HuMaxBox" Text="3000"
+                                 Background="#1e1e38" Foreground="White"
+                                 BorderBrush="#3a3a60" FontSize="11"
+                                 Padding="4,3" TextChanged="HuRange_Changed"/>
+                    </StackPanel>
+                </Grid>
+
+                <!-- HU Range 시각적 표시 -->
+                <Border Background="#1e1e38" CornerRadius="3" Padding="6,4" Margin="0,0,0,4">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Foreground="#64748b" FontSize="10" Text="HU: "/>
+                        <TextBlock x:Name="HuRangeDisplay" Foreground="#94a3b8" FontSize="10" Text="400 ~ 3000"/>
+                    </StackPanel>
+                </Border>
+
+                <!-- Smart Brush 토글 -->
+                <ToggleButton x:Name="SmartBrushBtn"
+                              Content="⚡ Smart Brush (HU Gate)"
+                              IsChecked="True"
+                              Click="SmartBrush_Click"
+                              Margin="0,0,0,4"
+                              Background="#1e1e38" BorderBrush="#3a3a60"
+                              Foreground="#94a3b8" FontSize="10"
+                              Padding="6,5" HorizontalContentAlignment="Left"/>
+
+                <Separator Margin="0,4" Background="#2d2d50"/>
+
+                <!-- ── 브러시 도구 ─────────────────────────────────── -->
+                <TextBlock Text="BRUSH TOOLS" Foreground="#475569" FontSize="9"
+                           FontWeight="Bold" Margin="2,0,0,4"/>
+
+                <Grid Margin="0,0,0,6">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <Button x:Name="DrawBtn" Content="✏ Draw [B]"
+                            Click="Draw_Click"
+                            Background="#1c3a5e" BorderBrush="#3b82f6"
+                            Foreground="#93c5fd" FontSize="10" Padding="0,6"
+                            Margin="0,0,2,0"/>
+                    <Button x:Name="EraseBtn" Content="🗑 Erase [E]"
+                            Grid.Column="1"
+                            Click="Erase_Click"
+                            Background="#1e1e38" BorderBrush="#3a3a60"
+                            Foreground="#94a3b8" FontSize="10" Padding="0,6"
+                            Margin="2,0,0,0"/>
+                </Grid>
+
+                <!-- 브러시 크기 -->
+                <StackPanel Margin="0,0,0,6">
+                    <DockPanel>
+                        <TextBlock Text="Brush Size" Foreground="#64748b" FontSize="9"/>
+                        <TextBlock x:Name="BrushSizeLabel" Text="12" Foreground="#94a3b8"
+                                   FontSize="9" HorizontalAlignment="Right" DockPanel.Dock="Right"/>
+                    </DockPanel>
+                    <Slider x:Name="BrushSizeSlider" Minimum="2" Maximum="80" Value="12"
+                            TickFrequency="2" IsSnapToTickEnabled="True"
+                            Foreground="#3b82f6"
+                            ValueChanged="BrushSize_Changed"/>
+                </StackPanel>
+
+                <Separator Margin="0,4" Background="#2d2d50"/>
+
+                <!-- ── 채우기 / 세그멘테이션 ─────────────────────────── -->
+                <TextBlock Text="SEGMENTATION" Foreground="#475569" FontSize="9"
+                           FontWeight="Bold" Margin="2,0,0,4"/>
+
+                <Button x:Name="FillSliceBtn" Content="▶ Fill This Slice"
+                        Click="FillSlice_Click"
+                        Background="#1e1e38" BorderBrush="#3a3a60"
+                        Foreground="#94a3b8" FontSize="10"
+                        Padding="8,6" Margin="0,0,0,3"
+                        HorizontalContentAlignment="Left"/>
+
+                <Button x:Name="FillAllBtn" Content="⏩ Fill All Slices"
+                        Click="FillAll_Click"
+                        Background="#1e1e38" BorderBrush="#3a3a60"
+                        Foreground="#94a3b8" FontSize="10"
+                        Padding="8,6" Margin="0,0,0,3"
+                        HorizontalContentAlignment="Left"/>
+
+                <!-- 진행 바 (Fill All 중) -->
+                <ProgressBar x:Name="FillProgressBar"
+                             Minimum="0" Maximum="100" Value="0"
+                             Height="3" Margin="0,0,0,6"
+                             Foreground="#3b82f6" Background="#1e1e38"
+                             Visibility="Collapsed"/>
+
+                <Separator Margin="0,4" Background="#2d2d50"/>
+
+                <!-- ── 3D 생성 ──────────────────────────────────────── -->
+                <TextBlock Text="3D RENDERING" Foreground="#475569" FontSize="9"
+                           FontWeight="Bold" Margin="2,0,0,4"/>
+
+                <Button x:Name="Generate3DBtn"
+                        Content="🧊 Generate 3D [G]"
+                        Click="Generate3D_Click"
+                        Background="#1c3a5e" BorderBrush="#3b82f6"
+                        Foreground="#93c5fd" FontSize="11" FontWeight="SemiBold"
+                        Padding="8,8" Margin="0,0,0,4"
+                        HorizontalContentAlignment="Left"/>
+
+                <!-- AI 세그멘테이션 (Python 백엔드) -->
+                <Button x:Name="AISegBtn"
+                        Content="🤖 AI Segmentation"
+                        Click="AISeg_Click"
+                        Background="#1a2a1a" BorderBrush="#22c55e"
+                        Foreground="#86efac" FontSize="10"
+                        Padding="8,6" Margin="0,0,0,4"
+                        HorizontalContentAlignment="Left"/>
+
+                <!-- 오버레이 토글 -->
+                <ToggleButton x:Name="OverlayToggle"
+                              Content="👁 Segmentation Overlay [H]"
+                              IsChecked="True"
+                              Click="Overlay_Click"
+                              Background="#1e1e38" BorderBrush="#3a3a60"
+                              Foreground="#94a3b8" FontSize="10"
+                              Padding="8,5" HorizontalContentAlignment="Left"/>
+
+            </StackPanel>
+        </ScrollViewer>
+    </DockPanel>
+</UserControl>

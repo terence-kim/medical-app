@@ -40,3 +40,9 @@ declare module '@kitware/vtk.js/Filters/General/ImageMarchingCubes' {
     const ImageMarchingCubes: any;
     export default ImageMarchingCubes;
 }
+
+declare module '@kitware/vtk.js/Filters/General/WindowedSincPolyDataFilter' {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const WindowedSincPolyDataFilter: any;
+    export default WindowedSincPolyDataFilter;
+}

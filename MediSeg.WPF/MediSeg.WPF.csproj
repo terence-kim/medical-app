@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>MediSeg</AssemblyName>
+    <RootNamespace>MediSeg.WPF</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>enable</Nullable>
+    <Optimize>true</Optimize>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- DICOM 파일 읽기 -->
+    <PackageReference Include="fo-dicom" Version="5.1.2" />
+    <!-- MVVM 헬퍼 -->
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.3.2" />
+    <!-- XAML Behaviors -->
+    <PackageReference Include="Microsoft.Xaml.Behaviors.WPF" Version="1.1.135" />
+  </ItemGroup>
+
+
+</Project>

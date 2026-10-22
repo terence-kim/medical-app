@@ -12,6 +12,7 @@ import vtkImageData from '@kitware/vtk.js/Common/DataModel/ImageData';
 import vtkDataArray from '@kitware/vtk.js/Common/Core/DataArray';
 import vtkImageMarchingCubes from '@kitware/vtk.js/Filters/General/ImageMarchingCubes';
 import vtkWindowedSincPolyDataFilter from '@kitware/vtk.js/Filters/General/WindowedSincPolyDataFilter';
+import vtkSTLWriter from '@kitware/vtk.js/IO/Geometry/STLWriter';
 import vtkPlane from '@kitware/vtk.js/Common/DataModel/Plane';
 import vtkInteractorStyleManipulator from '@kitware/vtk.js/Interaction/Style/InteractorStyleManipulator';
 import vtkMouseCameraTrackballRotateManipulator from '@kitware/vtk.js/Interaction/Manipulators/MouseCameraTrackballRotateManipulator';
@@ -129,6 +130,9 @@ interface VTKViewerProps {
     }) => void;
     /** 3D 부위 표시가 바뀔 때 2D 오버레이와 맞추기 위해 알림. null = 아직 생성 전 */
     onVisibleOrgansChange?: (ids: string[] | null) => void;
+    /** AI 세그멘테이션용 — vtk renderer/renderWindow 참조를 부모에게 노출 */
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    vtkContextRef?: React.MutableRefObject<{ renderer: any; renderWindow: any } | null>;
 }
 
 type FullScreenRenderer = ReturnType<typeof vtkFullScreenRenderWindow.newInstance>;
@@ -141,7 +145,7 @@ interface VtkContext {
     maskVolume: VtkVolumeActor | null;
 }
 
-function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGeneratingChange, generateRef, refreshLabelMapRef, refreshSliceRef, on3DLabelMapEdited, onVisibleOrgansChange }: VTKViewerProps) {
+function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGeneratingChange, generateRef, refreshLabelMapRef, refreshSliceRef, on3DLabelMapEdited, onVisibleOrgansChange, vtkContextRef }: VTKViewerProps) {
     const vtkContainerRef = useRef<HTMLDivElement>(null);
     const context = useRef<VtkContext | null>(null);
     const [isLoading,      setIsLoading]      = useState(false);
@@ -161,7 +165,7 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         direction?: any,
     ) => void) | null>(null);
-    const rebuildMeshesFromLabelMapRef = useRef<() => Promise<void>>(async () => {});
+    const rebuildMeshesFromLabelMapRef = useRef<() => Promise<void>>(async () => { /* populated below */ });
     const meshRebuildTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     // Keep a ref to masks for use in generateSurfaceMeshes callback
     const masksRef      = useRef<Mask[]>(masks);
@@ -283,6 +287,8 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
     // Segmentation-only mode: hide the CT volume, show only the painted mask.
     // Auto-enabled when the user first sends a labelmap from the 2D view.
     const [segOnlyMode, setSegOnlyMode] = useState(false);
+    // 부위별 CT 패널 접기/펼치기 (기본 접힘 — 3D 콘텐츠 가리지 않도록)
+    const [organPanelOpen, setOrganPanelOpen] = useState(false);
 
     // Store metadata to reconstruct mask volume
     interface VolumeMetadata {
@@ -439,6 +445,9 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
             maskVolume: null,
         };
 
+        // AI 세그멘테이션용 컨텍스트 노출
+        if (vtkContextRef) vtkContextRef.current = { renderer, renderWindow };
+
         return () => {
             container.removeEventListener('mousedown', blockMiddleAutoscroll, { capture: true } as EventListenerOptions);
             container.removeEventListener('auxclick', blockMiddleAutoscroll);
@@ -481,6 +490,8 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
                 setTool3D(lassoMode ? 'move' : 'lasso');
             }
         };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
     }, [is3DEraseMode, lassoMode]);
 
     // Toggle CT volume visibility based on segmentation-only mode
@@ -1218,6 +1229,29 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
         syncLabelMapTo2D();
     };
 
+    // ── STL / OBJ export ─────────────────────────────────────────────────────
+    const exportMeshesAsSTL = useCallback(() => {
+        const actors = Object.entries(meshActorByIdRef.current);
+        if (actors.length === 0) { alert('먼저 3D 모델을 생성해주세요.'); return; }
+        actors.forEach(([id, actor]) => {
+            try {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const mapper = actor.getMapper?.() as any;
+                const pd = mapper?.getInputData?.();
+                if (!pd) return;
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const writeSTL = (vtkSTLWriter as any).STATIC?.writeSTL;
+                if (!writeSTL) { console.warn('writeSTL not found'); return; }
+                const stlData = writeSTL(pd);
+                const blob = new Blob([stlData], { type: 'application/octet-stream' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url; a.download = `${id}_mesh.stl`; a.click();
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+            } catch (e) { console.warn('STL export failed for', id, e); }
+        });
+    }, []);
+
     // Expose generate to parent via generateRef
     // One click: if volume not yet loaded → load volume THEN immediately generate meshes.
     // If already loaded → regenerate meshes only.
@@ -1266,7 +1300,7 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
         }
         renderWindow.render();
     };
-    const rebuildMeshesFromLabelMapRef = useRef(rebuildMeshesFromLabelMap);
+    // rebuildMeshesFromLabelMapRef was declared above; update its .current here
     rebuildMeshesFromLabelMapRef.current = rebuildMeshesFromLabelMap;
     const scheduleMeshRebuild = () => {
         if (meshRebuildTimerRef.current) clearTimeout(meshRebuildTimerRef.current);
@@ -1817,128 +1851,115 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
                 </div>
             )}
 
-            {/* ── Organ selection + HU control panel ───────────────────────── */}
+            {/* ── Organ selection + HU control panel (좌하단 접이식) ─────────── */}
             {isGenerated && !isLoading && (
-                <div className="absolute bottom-4 left-4 z-10 w-64 bg-[#1a1a1a]/95 backdrop-blur border border-[#333] rounded-lg shadow-2xl overflow-hidden">
-                    {/* Header */}
-                    <div className="flex items-center justify-between px-3 py-2 border-b border-[#2a2a2a]">
-                        <span className="text-[11px] font-semibold text-slate-200">
-                            {hasMeshes ? '부위별 표시' : '부위별 CT 세그멘테이션'}
+                <div className="absolute bottom-3 left-3 z-10 w-60 bg-[#141420]/95 backdrop-blur border border-[#2a2a45] rounded-lg shadow-2xl overflow-hidden">
+                    {/* Header — 클릭으로 접기/펼치기 */}
+                    <div
+                        className="flex items-center justify-between px-3 py-1.5 border-b border-[#2a2a40] cursor-pointer hover:bg-[#1e1e38] transition-colors select-none"
+                        onClick={() => setOrganPanelOpen(v => !v)}
+                    >
+                        <span className="text-[10px] font-semibold text-slate-300">
+                            {hasMeshes ? '🎨 부위별 표시' : '🎨 CT HU 시각화'}
                         </span>
                         <div className="flex items-center gap-1">
-                            {hasMeshes && generatedOrganIds.length > 0 && (
+                            {hasMeshes && (
                                 <button
-                                    onClick={() => {
+                                    onClick={e => { e.stopPropagation(); exportMeshesAsSTL(); }}
+                                    className="text-[9px] text-slate-400 hover:text-sky-400 bg-[#222] hover:bg-[#1a2a3a] px-1.5 py-0.5 rounded transition-colors"
+                                    title="STL 내보내기 (각 장기별 파일)">
+                                    💾 STL
+                                </button>
+                            )}
+                            <span className="text-slate-500 text-[10px]">{organPanelOpen ? '▲' : '▼'}</span>
+                        </div>
+                    </div>
+                    {/* 펼쳐진 상태에서만 내부 표시 */}
+                    {organPanelOpen && (
+                        <>
+                            {/* 전체/해제 버튼 */}
+                            <div className="flex items-center justify-end gap-1 px-2 pt-1">
+                                {hasMeshes && generatedOrganIds.length > 0 && (
+                                    <button onClick={() => {
                                         const all = new Set(generatedOrganIds);
-                                        applyAllOrganVisibility(all);
-                                        setActiveOrgans(all);
-                                        emitVisibleOrgans([...all]);
-                                    }}
-                                    className="text-[9px] text-slate-500 hover:text-slate-300 bg-[#222] hover:bg-[#2a2a2a] px-1.5 py-0.5 rounded transition-colors">
-                                    전체
-                                </button>
-                            )}
+                                        applyAllOrganVisibility(all); setActiveOrgans(all); emitVisibleOrgans([...all]);
+                                    }} className="text-[9px] text-slate-500 hover:text-slate-300 bg-[#222] hover:bg-[#2a2a3a] px-1.5 py-0.5 rounded transition-colors">전체</button>
+                                )}
+                                {activeOrgans.size > 0 && (
+                                    <button onClick={() => {
+                                        applyAllOrganVisibility(new Set()); setActiveOrgans(new Set()); emitVisibleOrgans([]);
+                                    }} className="text-[9px] text-slate-500 hover:text-slate-300 bg-[#222] hover:bg-[#2a2a3a] px-1.5 py-0.5 rounded transition-colors">해제</button>
+                                )}
+                            </div>
+
+                            {/* Organ toggle grid */}
+                            <div className="p-2 grid grid-cols-4 gap-1">
+                                {organDefs.map(org => {
+                                    const isActive = activeOrgans.has(org.id);
+                                    const generated = generatedOrganIds.includes(org.id);
+                                    return (
+                                        <button key={org.id} onClick={() => toggleOrgan(org.id)}
+                                            className={`flex flex-col items-center py-1.5 px-1 rounded text-[9px] font-semibold transition-all border ${
+                                                isActive ? 'border-transparent text-slate-900'
+                                                    : generated ? 'border-[#444] text-slate-400 hover:text-slate-200 hover:border-slate-500 bg-[#111]'
+                                                        : 'border-[#333] text-slate-500 hover:text-slate-300 hover:border-slate-600 bg-[#111]'
+                                            }`}
+                                            style={isActive ? { backgroundColor: org.colorCss, borderColor: org.colorCss } : {}}>
+                                            <span className="w-3 h-3 rounded-full mb-0.5 shrink-0"
+                                                style={{ backgroundColor: org.colorCss,
+                                                         boxShadow: isActive ? `0 0 5px ${org.colorCss}` : 'none',
+                                                         opacity: hasMeshes && !generated && !isActive ? 0.4 : 1 }} />
+                                            {org.label.split(' ')[0]}
+                                        </button>
+                                    );
+                                })}
+                            </div>
+
+                            {/* Per-active-organ HU sliders */}
                             {activeOrgans.size > 0 && (
-                                <button onClick={() => {
-                                    applyAllOrganVisibility(new Set());
-                                    setActiveOrgans(new Set());
-                                    emitVisibleOrgans([]);
-                                }}
-                                    className="text-[9px] text-slate-500 hover:text-slate-300 bg-[#222] hover:bg-[#2a2a2a] px-1.5 py-0.5 rounded transition-colors">
-                                    해제
-                                </button>
+                                <div className="border-t border-[#2a2a40] px-3 py-2 space-y-3 max-h-44 overflow-y-auto">
+                                    {[...activeOrgans].map(id => {
+                                        const org    = organDefs.find(o => o.id === id);
+                                        const bounds = ORG_BOUNDS[id] ?? ORG_BOUNDS.custom;
+                                        if (!org) return null;
+                                        return (
+                                            <div key={id} className="space-y-1">
+                                                <div className="flex items-center justify-between">
+                                                    <span className="text-[10px] font-semibold" style={{ color: org.colorCss }}>{org.label.split(' ')[0]}</span>
+                                                    <span className="text-[9px] text-slate-500 tabular-nums">{org.huMin}~{org.huMax} HU</span>
+                                                </div>
+                                                <div className="flex items-center gap-1.5">
+                                                    <span className="text-[9px] text-slate-600 w-5">Min</span>
+                                                    <input type="range" min={bounds.minLo} max={Math.min(bounds.minHi, org.huMax - 1)}
+                                                        value={org.huMin} onChange={e => setOrgHU(id, 'min', Number(e.target.value))}
+                                                        className="flex-1 h-1 rounded appearance-none cursor-pointer" style={{ accentColor: org.colorCss }} />
+                                                    <span className="text-[9px] text-slate-400 w-8 text-right tabular-nums">{org.huMin}</span>
+                                                </div>
+                                                <div className="flex items-center gap-1.5">
+                                                    <span className="text-[9px] text-slate-600 w-5">Max</span>
+                                                    <input type="range" min={Math.max(bounds.maxLo, org.huMin + 1)} max={bounds.maxHi}
+                                                        value={org.huMax} onChange={e => setOrgHU(id, 'max', Number(e.target.value))}
+                                                        className="flex-1 h-1 rounded appearance-none cursor-pointer" style={{ accentColor: org.colorCss }} />
+                                                    <span className="text-[9px] text-slate-400 w-8 text-right tabular-nums">{org.huMax}</span>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
                             )}
-                        </div>
-                    </div>
 
-                    {/* Organ toggle grid */}
-                    <div className="p-2 grid grid-cols-4 gap-1">
-                        {organDefs.map(org => {
-                            const isActive = activeOrgans.has(org.id);
-                            const generated = generatedOrganIds.includes(org.id);
-                            return (
-                                <button key={org.id} onClick={() => toggleOrgan(org.id)}
-                                    className={`flex flex-col items-center py-1.5 px-1 rounded text-[9px] font-semibold transition-all border ${
-                                        isActive
-                                            ? 'border-transparent text-slate-900'
-                                            : generated
-                                                ? 'border-[#444] text-slate-400 hover:text-slate-200 hover:border-slate-500 bg-[#111]'
-                                                : 'border-[#333] text-slate-500 hover:text-slate-300 hover:border-slate-600 bg-[#111]'
-                                    }`}
-                                    style={isActive ? { backgroundColor: org.colorCss, borderColor: org.colorCss } : {}}>
-                                    <span className="w-3 h-3 rounded-full mb-0.5 shrink-0"
-                                        style={{ backgroundColor: org.colorCss,
-                                                 boxShadow: isActive ? `0 0 5px ${org.colorCss}` : 'none',
-                                                 opacity: hasMeshes && !generated && !isActive ? 0.4 : 1 }} />
-                                    {org.label.split(' ')[0]}
+                            {/* Generate Model 버튼 */}
+                            <div className="px-2 pb-2 pt-1 border-t border-[#2a2a40]">
+                                <button onClick={generateSurfaceMeshes} disabled={isLoading}
+                                    className="w-full py-1.5 rounded text-[10px] font-semibold bg-emerald-800 hover:bg-emerald-700 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+                                    ⬡ Generate Model
                                 </button>
-                            );
-                        })}
-                    </div>
-
-                    {/* Per-active-organ HU sliders */}
-                    {activeOrgans.size > 0 && (
-                        <div className="border-t border-[#2a2a2a] px-3 py-2 space-y-3 max-h-52 overflow-y-auto">
-                            {[...activeOrgans].map(id => {
-                                const org    = organDefs.find(o => o.id === id);
-                                const bounds = ORG_BOUNDS[id] ?? ORG_BOUNDS.custom;
-                                if (!org) return null;
-                                return (
-                                    <div key={id} className="space-y-1">
-                                        <div className="flex items-center justify-between">
-                                            <span className="text-[10px] font-semibold" style={{ color: org.colorCss }}>
-                                                {org.label.split(' ')[0]}
-                                            </span>
-                                            <span className="text-[9px] text-slate-500 tabular-nums">
-                                                {org.huMin} ~ {org.huMax} HU
-                                            </span>
-                                        </div>
-                                        {/* Min */}
-                                        <div className="flex items-center gap-1.5">
-                                            <span className="text-[9px] text-slate-600 w-5">Min</span>
-                                            <input type="range"
-                                                min={bounds.minLo} max={Math.min(bounds.minHi, org.huMax - 1)}
-                                                value={org.huMin}
-                                                onChange={e => setOrgHU(id, 'min', Number(e.target.value))}
-                                                className="flex-1 h-1 rounded appearance-none cursor-pointer"
-                                                style={{ accentColor: org.colorCss }} />
-                                            <span className="text-[9px] text-slate-400 w-8 text-right tabular-nums">{org.huMin}</span>
-                                        </div>
-                                        {/* Max */}
-                                        <div className="flex items-center gap-1.5">
-                                            <span className="text-[9px] text-slate-600 w-5">Max</span>
-                                            <input type="range"
-                                                min={Math.max(bounds.maxLo, org.huMin + 1)} max={bounds.maxHi}
-                                                value={org.huMax}
-                                                onChange={e => setOrgHU(id, 'max', Number(e.target.value))}
-                                                className="flex-1 h-1 rounded appearance-none cursor-pointer"
-                                                style={{ accentColor: org.colorCss }} />
-                                            <span className="text-[9px] text-slate-400 w-8 text-right tabular-nums">{org.huMax}</span>
-                                        </div>
-                                    </div>
-                                );
-                            })}
-                        </div>
+                                <p className="text-[9px] text-slate-600 text-center mt-1">
+                                    {hasMeshes ? '버튼 클릭으로 부위별 ON/OFF' : '우측 레이어 체크 후 생성'}
+                                </p>
+                            </div>
+                        </>
                     )}
-
-                    {/* Generate Model button inside the panel */}
-                    <div className="px-3 py-2 border-t border-[#2a2a2a]">
-                        <button
-                            onClick={generateSurfaceMeshes}
-                            disabled={isLoading}
-                            className="w-full py-1.5 rounded text-[11px] font-semibold bg-emerald-700 hover:bg-emerald-600 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
-                            ⬡ Generate Model
-                        </button>
-                        {hasMeshes ? (
-                            <p className="text-[9px] text-slate-500 text-center mt-1">
-                                위 버튼을 눌러 부위별로 켜고 끄세요
-                            </p>
-                        ) : activeOrgans.size === 0 ? (
-                            <p className="text-[9px] text-slate-600 text-center mt-1">
-                                우측 레이어에서 체크한 부위만 생성됩니다
-                            </p>
-                        ) : null}
-                    </div>
                 </div>
             )}
 

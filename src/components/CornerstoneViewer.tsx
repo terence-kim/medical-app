@@ -69,6 +69,21 @@ const TISSUE_TYPES: TissueType[] = [
     },
 ];
 
+// ── Measurement tool types ────────────────────────────────────────────────────
+export type MeasTool = 'ruler' | 'roi' | 'probe';
+export interface MeasPt   { x: number; y: number }    // image-pixel coordinates
+export interface MeasItem {
+    id: string;
+    type: 'ruler' | 'roi';
+    sliceIdx: number;
+    pts: MeasPt[];
+    distMm?: number;        // ruler: distance in mm
+    stats?: {               // roi: HU statistics
+        mean: number; std: number; min: number; max: number;
+        areaCm2: number; count: number;
+    };
+}
+
 // Segment colour LUT — rebuilt dynamically from extMasks.
 // Layout: [r0,g0,b0,a0, r1,g1,b1,a1, …]  (a=0 means transparent / unused index)
 const SEG_LUT_SIZE = 16;
@@ -109,6 +124,13 @@ export interface CornerstoneViewerHandle {
         xyScale: number; zStep: number;
         previous?: Uint8Array;
     }) => void;
+    /** Measurement tools */
+    setMeasTool: (tool: MeasTool | null) => void;
+    getMeasItems: () => MeasItem[];
+    clearMeasurements: () => void;
+    /** Cine mode */
+    setCineActive: (active: boolean) => void;
+    getCineActive: () => boolean;
 }
 
 interface CornerstoneViewerProps {
@@ -144,6 +166,8 @@ interface CornerstoneViewerProps {
     imperativeRef?:  React.MutableRefObject<CornerstoneViewerHandle | null>;
     /** Called on every slice change — useful for crosshair sync in quad layout */
     onSliceChange?:  (sliceIdx: number) => void;
+    /** Called when a measurement is added/removed — parent can show a panel */
+    onMeasItemsChange?: (items: MeasItem[]) => void;
 }
 
 const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneViewerProps) => {
@@ -206,6 +230,36 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
     // Separate top-most canvas just for the brush/eraser cursor circle (updated on every mousemove)
     const cursorCanvasRef  = useRef<HTMLCanvasElement>(null);
     const offscreenRef     = useRef<HTMLCanvasElement | null>(null);
+
+    // ── Measurement tool state ────────────────────────────────────────────────
+    const [measTool,   setMeasTool]   = useState<MeasTool | null>(null);
+    const measToolRef  = useRef<MeasTool | null>(null);
+    measToolRef.current = measTool;
+    const [measItems,  setMeasItems]  = useState<MeasItem[]>([]);
+    const measItemsRef2 = useRef<MeasItem[]>([]);
+    measItemsRef2.current = measItems;
+    const measDrawRef   = useRef<{ pts: MeasPt[]; live: MeasPt | null } | null>(null);
+    const measureCanvasRef = useRef<HTMLCanvasElement>(null);
+    const renderMeasRef = useRef<(() => void) | null>(null);
+    const [probeHU,    setProbeHU]    = useState<{ hu: number; cx: number; cy: number } | null>(null);
+    // ── Cine mode ─────────────────────────────────────────────────────────────
+    const [cineActive, setCineActiveState] = useState(false);
+    const cineActiveRef = useRef(false);
+    const cineTimerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+    const [cineFps,    setCineFps]    = useState(8);
+    const cineFpsRef   = useRef(8);
+    cineFpsRef.current = cineFps;
+
+    // ── 3D → 2D labelmap direct storage (bypasses cornerstoneTools state complexity) ──
+    // Populated by apply3DLabelMap; read by renderSegOverlay to guarantee overlay shows
+    // even when cornerstoneTools internal state (uuid/activeLabelmapIndex) is inconsistent.
+    const from3DVolumeRef = useRef<{
+        data: Uint8Array;
+        volW: number; volH: number; volD: number;
+        zStep: number;
+    } | null>(null);
+    // Cache: sliceIndex → rendered Uint8Array(imageW * imageH) for current imageW/imageH
+    const from3DSliceCacheRef = useRef<{ slices: Map<number, Uint8Array>; imageW: number; imageH: number } | null>(null);
 
     // Ref to current extMasks for use inside fillAllSlicesForOrgan callback
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -512,6 +566,38 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
         }).catch(err => console.error('navigateSlice: loadImage failed', err));
     }, []);
 
+    // ── Cine mode (auto-scroll through slices) ────────────────────────────────
+    const setCineActive = useCallback((active: boolean) => {
+        cineActiveRef.current = active;
+        setCineActiveState(active);
+        if (!active) {
+            if (cineTimerRef.current != null) { clearInterval(cineTimerRef.current); cineTimerRef.current = null; }
+        }
+    }, []);
+
+    useEffect(() => {
+        if (!cineActive) {
+            if (cineTimerRef.current != null) { clearInterval(cineTimerRef.current); cineTimerRef.current = null; }
+            return;
+        }
+        cineTimerRef.current = setInterval(() => {
+            const total = totalImagesRef.current;
+            if (total <= 0) return;
+            const next = (currentIndexRef.current + 1) % total;
+            if (sortedFiles.length > 0 && elementRef.current) {
+                const imageId = `wadouri:file://${sortedFiles[next].name}`;
+                // Use navigateSlice equivalent
+                currentIndexRef.current = next;
+                const el = elementRef.current;
+                cornerstone.loadImage(imageId).then(img => {
+                    cornerstone.displayImage(el, img);
+                }).catch(() => {});
+            }
+        }, Math.round(1000 / cineFps));
+        return () => { if (cineTimerRef.current != null) { clearInterval(cineTimerRef.current); cineTimerRef.current = null; } };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [cineActive, cineFps, sortedFiles]);
+
     // ── Keyboard shortcuts (arrow keys = slices, Page = ±5) ──────────────────
     useEffect(() => {
         const handle = (e: KeyboardEvent) => {
@@ -646,11 +732,51 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
                 } catch { /* no labelmap for this slice */ }
             }
 
+            const { width, height } = image;
+
+            // ── 3D-generated labelmap fallback (more reliable than cornerstoneTools state) ──
+            // When Generate 3D has run, from3DVolumeRef holds the raw VTK volume.
+            // We compute (and cache) the 2D slice on demand so the overlay always shows.
+            const v3d = from3DVolumeRef.current;
+            if (v3d) {
+                let cache = from3DSliceCacheRef.current;
+                if (!cache || cache.imageW !== width || cache.imageH !== height) {
+                    cache = { slices: new Map(), imageW: width, imageH: height };
+                    from3DSliceCacheRef.current = cache;
+                }
+                if (!cache.slices.has(displayedSlice)) {
+                    const sz = Math.max(1, v3d.zStep);
+                    const si = Math.min(Math.floor(displayedSlice / sz), v3d.volD - 1);
+                    const volBase = si * v3d.volW * v3d.volH;
+                    const slice = new Uint8Array(width * height);
+                    for (let r = 0; r < height; r++) {
+                        const vr = Math.min(Math.floor(r * v3d.volH / height), v3d.volH - 1);
+                        const rowBase = volBase + vr * v3d.volW;
+                        for (let c = 0; c < width; c++) {
+                            const vc = Math.min(Math.floor(c * v3d.volW / width), v3d.volW - 1);
+                            slice[r * width + c] = v3d.data[rowBase + vc] ?? 0;
+                        }
+                    }
+                    cache.slices.set(displayedSlice, slice);
+                }
+                const g3dSlice = cache.slices.get(displayedSlice)!;
+                if (!pd || pd.length !== width * height) {
+                    // No manual paint → use 3D labelmap directly
+                    pd = g3dSlice;
+                } else {
+                    // Merge: manual paint takes precedence, 3D fills the rest
+                    const merged = new Uint8Array(pd.length);
+                    for (let i = 0; i < pd.length; i++) {
+                        merged[i] = pd[i] !== 0 ? pd[i] : g3dSlice[i];
+                    }
+                    pd = merged;
+                }
+            }
+
             // Only painted pixels are drawn. HU preview of the whole slice is gone —
             // Smart Brush filters HU inside the cursor circle at paint time instead.
             if (!pd) return;
 
-            const { width, height } = image;
             if (pd.length !== width * height) return;
 
             if (!imgDataRef.current
@@ -708,6 +834,208 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             console.warn('renderSegOverlay error:', err);
         }
     }, []);
+
+    // ── Measurement tool utilities ────────────────────────────────────────────
+    /** Convert image-pixel coords → measure-canvas coords. */
+    const imageToMeasCanvas = useCallback((imgX: number, imgY: number) => {
+        const element = elementRef.current;
+        const mc = measureCanvasRef.current;
+        if (!element || !mc) return null;
+        const csCanvas = element.querySelector('canvas') as HTMLCanvasElement | null;
+        if (!csCanvas || csCanvas.width === 0) return null;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const cs = cornerstone as any;
+        try {
+            const p = cs.pixelToCanvas(element, { x: imgX, y: imgY });
+            return { x: p.x * mc.width / csCanvas.width, y: p.y * mc.height / csCanvas.height };
+        } catch { return null; }
+    }, []);
+
+    /** Convert measure-canvas coords → image-pixel coords. */
+    const measCanvasToImage = useCallback((cx: number, cy: number) => {
+        const element = elementRef.current;
+        const mc = measureCanvasRef.current;
+        if (!element || !mc) return null;
+        const csCanvas = element.querySelector('canvas') as HTMLCanvasElement | null;
+        if (!csCanvas || csCanvas.width === 0) return null;
+        // Scale to CS-canvas space
+        const scx = cx * csCanvas.width / mc.width;
+        const scy = cy * csCanvas.height / mc.height;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const cs = cornerstone as any;
+        try {
+            const p0 = cs.pixelToCanvas(element, { x: 0, y: 0 });
+            const px = cs.pixelToCanvas(element, { x: 1, y: 0 });
+            const py = cs.pixelToCanvas(element, { x: 0, y: 1 });
+            const a = px.x - p0.x, b = py.x - p0.x;
+            const c = px.y - p0.y, d = py.y - p0.y;
+            const det = a * d - b * c;
+            if (Math.abs(det) < 1e-9) return null;
+            const dx = scx - p0.x, dy = scy - p0.y;
+            return { x: (d * dx - b * dy) / det, y: (a * dy - c * dx) / det };
+        } catch { return null; }
+    }, []);
+
+    /** Read HU value at image pixel. */
+    const getHUAt = useCallback((imgX: number, imgY: number): number | null => {
+        const element = elementRef.current;
+        if (!element) return null;
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const image = cornerstone.getImage(element) as any;
+            if (!image) return null;
+            const slope = image.slope ?? 1, intercept = image.intercept ?? 0;
+            const px = Math.round(imgX), py = Math.round(imgY);
+            if (px < 0 || py < 0 || px >= image.width || py >= image.height) return null;
+            const raw = image.getPixelData()[py * image.width + px];
+            return raw * slope + intercept;
+        } catch { return null; }
+    }, []);
+
+    /** Compute ROI stats for rectangle [p1→p2] in image-pixel space. */
+    const computeRoiStats = useCallback((p1: MeasPt, p2: MeasPt) => {
+        const element = elementRef.current;
+        if (!element) return null;
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const image = cornerstone.getImage(element) as any;
+            if (!image) return null;
+            const slope = image.slope ?? 1, intercept = image.intercept ?? 0;
+            const x1 = Math.max(0, Math.round(Math.min(p1.x, p2.x)));
+            const y1 = Math.max(0, Math.round(Math.min(p1.y, p2.y)));
+            const x2 = Math.min(image.width - 1, Math.round(Math.max(p1.x, p2.x)));
+            const y2 = Math.min(image.height - 1, Math.round(Math.max(p1.y, p2.y)));
+            if (x2 <= x1 || y2 <= y1) return null;
+            const pixelData = image.getPixelData();
+            let sum = 0, sum2 = 0, mn = Infinity, mx = -Infinity, count = 0;
+            for (let r = y1; r <= y2; r++) {
+                for (let c = x1; c <= x2; c++) {
+                    const hu = pixelData[r * image.width + c] * slope + intercept;
+                    sum += hu; sum2 += hu * hu;
+                    if (hu < mn) mn = hu;
+                    if (hu > mx) mx = hu;
+                    count++;
+                }
+            }
+            if (count === 0) return null;
+            const mean = sum / count;
+            const std = Math.sqrt(Math.max(0, sum2 / count - mean * mean));
+            const colSp = image.columnPixelSpacing ?? 1;
+            const rowSp = image.rowPixelSpacing ?? 1;
+            const areaCm2 = ((x2 - x1) * colSp * (y2 - y1) * rowSp) / 100; // mm² → cm²
+            return { mean, std, min: mn, max: mx, areaCm2, count };
+        } catch { return null; }
+    }, []);
+
+    /** Render all committed measurements + current draft on the measure canvas. */
+    const renderMeasurements = useCallback(() => {
+        const mc = measureCanvasRef.current;
+        const element = elementRef.current;
+        if (!mc) return;
+        const csCanvas = element?.querySelector('canvas') as HTMLCanvasElement | null;
+        if (csCanvas && (mc.width !== csCanvas.width || mc.height !== csCanvas.height)) {
+            mc.width  = csCanvas.width  || mc.width  || 512;
+            mc.height = csCanvas.height || mc.height || 512;
+        }
+        if (csCanvas?.style.width)  mc.style.width  = csCanvas.style.width;
+        if (csCanvas?.style.height) mc.style.height = csCanvas.style.height;
+        const ctx = mc.getContext('2d');
+        if (!ctx) return;
+        ctx.clearRect(0, 0, mc.width, mc.height);
+
+        const sliceIdx = currentIndexRef.current ?? 0;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const image = element ? cornerstone.getImage(element) as any : null;
+        const colSp = image?.columnPixelSpacing ?? 1;
+        const rowSp = image?.rowPixelSpacing ?? 1;
+        const toC = (imgX: number, imgY: number) => imageToMeasCanvas(imgX, imgY);
+
+        // Draw committed items for current slice
+        for (const item of measItemsRef2.current) {
+            if (item.sliceIdx !== sliceIdx) continue;
+            if (item.type === 'ruler' && item.pts.length >= 2) {
+                const c1 = toC(item.pts[0].x, item.pts[0].y);
+                const c2 = toC(item.pts[1].x, item.pts[1].y);
+                if (!c1 || !c2) continue;
+                ctx.save();
+                ctx.strokeStyle = '#FFE44D'; ctx.lineWidth = 1.5;
+                ctx.setLineDash([5, 3]);
+                ctx.beginPath(); ctx.moveTo(c1.x, c1.y); ctx.lineTo(c2.x, c2.y); ctx.stroke();
+                ctx.setLineDash([]);
+                ctx.fillStyle = '#FFE44D';
+                [c1, c2].forEach(p => { ctx.beginPath(); ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2); ctx.fill(); });
+                if (item.distMm != null) {
+                    const lx = (c1.x + c2.x) / 2, ly = (c1.y + c2.y) / 2;
+                    ctx.fillStyle = 'rgba(0,0,0,0.65)'; ctx.fillRect(lx + 3, ly - 15, 72, 18);
+                    ctx.fillStyle = '#FFE44D'; ctx.font = 'bold 12px monospace';
+                    ctx.fillText(`${item.distMm.toFixed(1)} mm`, lx + 6, ly - 1);
+                }
+                ctx.restore();
+            }
+            if (item.type === 'roi' && item.pts.length >= 2) {
+                const c1 = toC(item.pts[0].x, item.pts[0].y);
+                const c2 = toC(item.pts[1].x, item.pts[1].y);
+                if (!c1 || !c2) continue;
+                const rx = Math.min(c1.x, c2.x), ry = Math.min(c1.y, c2.y);
+                const rw = Math.abs(c2.x - c1.x), rh = Math.abs(c2.y - c1.y);
+                ctx.save();
+                ctx.strokeStyle = '#4ADE80'; ctx.lineWidth = 1.5; ctx.setLineDash([5, 3]);
+                ctx.strokeRect(rx, ry, rw, rh);
+                ctx.setLineDash([]);
+                ctx.fillStyle = 'rgba(74,222,128,0.08)'; ctx.fillRect(rx, ry, rw, rh);
+                if (item.stats) {
+                    const s = item.stats;
+                    const lines = [`Mean ${s.mean.toFixed(0)} HU`, `SD ${s.std.toFixed(0)}`, `Min ${s.min.toFixed(0)} / Max ${s.max.toFixed(0)}`, `Area ${s.areaCm2.toFixed(2)} cm²`];
+                    const bx = rx + rw + 5, by = ry;
+                    ctx.fillStyle = 'rgba(0,0,0,0.75)'; ctx.fillRect(bx, by, 138, lines.length * 15 + 6);
+                    ctx.fillStyle = '#4ADE80'; ctx.font = '11px monospace';
+                    lines.forEach((l, i) => ctx.fillText(l, bx + 4, by + 15 * (i + 1)));
+                }
+                ctx.restore();
+            }
+        }
+
+        // Draw draft (in-progress)
+        const draft = measDrawRef.current;
+        if (draft && measToolRef.current) {
+            const tool = measToolRef.current;
+            if (tool === 'ruler' && draft.pts.length >= 1 && draft.live) {
+                const c1 = toC(draft.pts[0].x, draft.pts[0].y);
+                const c2 = toC(draft.live.x, draft.live.y);
+                if (c1 && c2) {
+                    const dx = (draft.live.x - draft.pts[0].x) * colSp;
+                    const dy = (draft.live.y - draft.pts[0].y) * rowSp;
+                    const d = Math.sqrt(dx * dx + dy * dy);
+                    ctx.save();
+                    ctx.strokeStyle = 'rgba(255,228,77,0.65)'; ctx.lineWidth = 1.5; ctx.setLineDash([4, 3]);
+                    ctx.beginPath(); ctx.moveTo(c1.x, c1.y); ctx.lineTo(c2.x, c2.y); ctx.stroke();
+                    ctx.setLineDash([]);
+                    ctx.fillStyle = '#FFE44D'; ctx.beginPath(); ctx.arc(c1.x, c1.y, 3, 0, Math.PI * 2); ctx.fill();
+                    const lx = (c1.x + c2.x) / 2, ly = (c1.y + c2.y) / 2;
+                    ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(lx + 3, ly - 15, 72, 18);
+                    ctx.fillStyle = '#FFE44D'; ctx.font = '11px monospace';
+                    ctx.fillText(`${d.toFixed(1)} mm`, lx + 6, ly - 1);
+                    ctx.restore();
+                }
+            }
+            if (tool === 'roi' && draft.pts.length >= 1 && draft.live) {
+                const c1 = toC(draft.pts[0].x, draft.pts[0].y);
+                const c2 = toC(draft.live.x, draft.live.y);
+                if (c1 && c2) {
+                    ctx.save();
+                    ctx.strokeStyle = 'rgba(74,222,128,0.6)'; ctx.lineWidth = 1.5; ctx.setLineDash([4, 3]);
+                    const rx = Math.min(c1.x, c2.x), ry = Math.min(c1.y, c2.y);
+                    ctx.strokeRect(rx, ry, Math.abs(c2.x - c1.x), Math.abs(c2.y - c1.y));
+                    ctx.setLineDash([]);
+                    ctx.fillStyle = 'rgba(74,222,128,0.06)'; ctx.fillRect(rx, ry, Math.abs(c2.x - c1.x), Math.abs(c2.y - c1.y));
+                    ctx.restore();
+                }
+            }
+        }
+    }, [imageToMeasCanvas]);
+
+    // Keep renderMeasRef current so event handlers can call it
+    renderMeasRef.current = renderMeasurements;
 
     // ── Brush / Eraser cursor rendering (separate thin canvas, high-freq) ────────
     // Keeps the cursor circle updating at mousemove speed without re-running the
@@ -806,11 +1134,15 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             renderSegOverlayRef.current?.(); // refresh once with preview re-enabled
         };
 
-        element.addEventListener('cornerstoneimagerendered', renderSegOverlay);
+        const onImageRendered = () => {
+            renderSegOverlay();
+            renderMeasRef.current?.();
+        };
+        element.addEventListener('cornerstoneimagerendered', onImageRendered);
         element.addEventListener('cornerstonetoolsmousedown', onToolsMouseDown);
         element.addEventListener('cornerstonetoolsmouseup',   onToolsMouseUp);
         return () => {
-            element.removeEventListener('cornerstoneimagerendered', renderSegOverlay);
+            element.removeEventListener('cornerstoneimagerendered', onImageRendered);
             element.removeEventListener('cornerstonetoolsmousedown', onToolsMouseDown);
             element.removeEventListener('cornerstonetoolsmouseup',   onToolsMouseUp);
         };
@@ -927,6 +1259,10 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             case 'Lung':        vp.voi = { windowWidth: 1500, windowCenter: -600 }; break;
             case 'Bone':        vp.voi = { windowWidth: 2000, windowCenter: 400  }; break;
             case 'Soft Tissue': vp.voi = { windowWidth: 400,  windowCenter: 40   }; break;
+            case 'Abdomen':     vp.voi = { windowWidth: 400,  windowCenter: 50   }; break;
+            case 'CTA':         vp.voi = { windowWidth: 700,  windowCenter: 150  }; break;
+            case 'Liver':       vp.voi = { windowWidth: 160,  windowCenter: 60   }; break;
+            case 'Brain+':      vp.voi = { windowWidth: 200,  windowCenter: 80   }; break;
         }
         cornerstone.setViewport(el, vp);
     };
@@ -1295,6 +1631,12 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
         const numSlices = totalImagesRef.current;
         const sz = Math.max(1, zStep);
 
+        // ── Store raw 3D volume in ref for reliable 2D overlay rendering ──
+        // This bypasses cornerstoneTools state complexity and is always accessible.
+        from3DVolumeRef.current = { data, volW, volH, volD, zStep };
+        from3DSliceCacheRef.current = null; // invalidate per-slice cache
+
+        // Also write into cornerstoneTools state for brush/erase tool compatibility
         for (let i = 0; i < numSlices; i++) {
             const pd = ensureLabelmapForSlice(i, w, h);
             if (!pd) continue;
@@ -1311,7 +1653,9 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             }
         }
         try { cornerstone.updateImage(element); } catch { /* ignore */ }
+        // Render immediately + once more after a frame to handle any async Cornerstone pipeline
         renderSegOverlayRef.current?.();
+        requestAnimationFrame(() => renderSegOverlayRef.current?.());
     }, [isReady, ensureLabelmapForSlice]);
 
     // "전체 스택 채우기" — uses the currently active mask (from external props)
@@ -1540,8 +1884,17 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
             sendTo3D: () => { extractLabelMapRef.current?.(); },
             applyOrgansSegmentation,
             apply3DLabelMap,
+            setMeasTool: (tool) => setMeasTool(tool),
+            getMeasItems: () => measItemsRef2.current,
+            clearMeasurements: () => {
+                setMeasItems([]);
+                measDrawRef.current = null;
+                renderMeasRef.current?.();
+            },
+            setCineActive,
+            getCineActive: () => cineActiveRef.current,
         };
-    }, [fillCurrentSlice, fillAllSlices, applyOrgansSegmentation, apply3DLabelMap, imperativeRef]);
+    }, [fillCurrentSlice, fillAllSlices, applyOrgansSegmentation, apply3DLabelMap, imperativeRef, setCineActive]);
 
     // Propagate fill progress to parent
     useEffect(() => {
@@ -1579,8 +1932,11 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
                 <div className="w-px h-5 bg-[#2d2d50] mx-0.5" />
 
                 {/* W/L presets */}
-                {(['Brain','Lung','Bone','Soft'] as const).map(p => (
-                    <button key={p} onClick={() => applyPreset(p === 'Soft' ? 'Soft Tissue' : p)}
+                {(['Brain','Lung','Bone','Soft','Abd','CTA'] as const).map(p => (
+                    <button key={p} onClick={() => applyPreset(
+                        p === 'Soft' ? 'Soft Tissue' :
+                        p === 'Abd'  ? 'Abdomen' :
+                        p === 'CTA'  ? 'CTA' : p)}
                         className="text-[10px] bg-[#1e1e38] hover:bg-[#2a2a50] text-slate-400 hover:text-slate-200 px-1.5 py-0.5 rounded transition-colors">
                         {p}
                     </button>
@@ -1588,12 +1944,59 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
 
                 <div className="w-px h-5 bg-[#2d2d50] mx-0.5" />
 
+                {/* Measurement tools (Ruler, ROI, Probe) */}
+                <TbBtn
+                    active={measTool === 'ruler'}
+                    onClick={() => { setMeasTool(measTool === 'ruler' ? null : 'ruler'); setActiveTool('Wwwc'); }}
+                    title="Ruler: 두 점 클릭 → 거리(mm) 측정">
+                    📏
+                </TbBtn>
+                <TbBtn
+                    active={measTool === 'roi'}
+                    onClick={() => { setMeasTool(measTool === 'roi' ? null : 'roi'); setActiveTool('Wwwc'); }}
+                    title="ROI: 드래그 → HU 통계 (Mean/SD/Min/Max/Area)">
+                    ▭
+                </TbBtn>
+                <TbBtn
+                    active={measTool === 'probe'}
+                    onClick={() => { setMeasTool(measTool === 'probe' ? null : 'probe'); setActiveTool('Wwwc'); }}
+                    title="Probe: 마우스 오버 → HU 값 표시">
+                    🔬
+                </TbBtn>
+                {measItems.length > 0 && (
+                    <button
+                        onClick={() => { setMeasItems([]); measDrawRef.current = null; renderMeasRef.current?.(); props.onMeasItemsChange?.([]); }}
+                        className="text-[10px] text-slate-500 hover:text-rose-400 px-1 transition-colors" title="측정 전체 삭제">
+                        ✕
+                    </button>
+                )}
+
+                <div className="w-px h-5 bg-[#2d2d50] mx-0.5" />
+
+                {/* Cine mode */}
+                <TbBtn
+                    active={cineActive}
+                    onClick={() => setCineActive(!cineActive)}
+                    title={cineActive ? 'Cine 중지 (자동 스크롤)' : 'Cine 시작 (자동 스크롤)'}>
+                    {cineActive ? '⏸' : '▶'}
+                </TbBtn>
+                {cineActive && (
+                    <>
+                        <input type="range" min="1" max="30" value={cineFps}
+                            onChange={e => setCineFps(Number(e.target.value))}
+                            className="w-12 h-1.5 appearance-none rounded accent-sky-500 bg-[#2d2d50] cursor-pointer" />
+                        <span className="text-[9px] text-slate-400 w-6 tabular-nums">{cineFps}fps</span>
+                    </>
+                )}
+
+                <div className="w-px h-5 bg-[#2d2d50] mx-0.5" />
+
                 {/* Segmentation tools */}
-                <TbBtn active={activeTool === 'Brush'} onClick={() => setActiveTool('Brush')} title="Draw brush (paint HU-matched regions)"
+                <TbBtn active={activeTool === 'Brush'} onClick={() => { setActiveTool('Brush'); setMeasTool(null); }} title="Draw brush (paint HU-matched regions)"
                     style={activeTool === 'Brush' ? { backgroundColor: activeMask?.colorCss ?? '#0ea5e9', color: '#000' } : {}}>
                     ✏ Draw
                 </TbBtn>
-                <TbBtn active={activeTool === 'Eraser'} onClick={() => setActiveTool('Eraser')} title="Eraser" danger>
+                <TbBtn active={activeTool === 'Eraser'} onClick={() => { setActiveTool('Eraser'); setMeasTool(null); }} title="Eraser" danger>
                     ⌫ Erase
                 </TbBtn>
 
@@ -1652,6 +2055,99 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
                     className="absolute inset-0 pointer-events-none"
                     style={{ width: '100%', height: '100%' }}
                 />
+                {/* Measurement canvas — captures pointer events when a meas tool is active */}
+                <canvas
+                    ref={measureCanvasRef}
+                    className="absolute inset-0"
+                    style={{
+                        width: '100%', height: '100%',
+                        pointerEvents: measTool ? 'auto' : 'none',
+                        cursor: measTool === 'ruler' || measTool === 'roi' ? 'crosshair' : measTool === 'probe' ? 'cell' : 'default',
+                        zIndex: measTool ? 5 : 0,
+                    }}
+                    onMouseDown={e => {
+                        if (!measToolRef.current || measToolRef.current === 'probe') return;
+                        const mc = measureCanvasRef.current;
+                        if (!mc) return;
+                        const rect = mc.getBoundingClientRect();
+                        const cx = (e.clientX - rect.left) * (mc.width / rect.width);
+                        const cy = (e.clientY - rect.top)  * (mc.height / rect.height);
+                        const img = measCanvasToImage(cx, cy);
+                        if (!img) return;
+                        measDrawRef.current = { pts: [img], live: img };
+                        renderMeasRef.current?.();
+                    }}
+                    onMouseMove={e => {
+                        if (!measToolRef.current) return;
+                        const mc = measureCanvasRef.current;
+                        if (!mc) return;
+                        const rect = mc.getBoundingClientRect();
+                        const cx = (e.clientX - rect.left) * (mc.width / rect.width);
+                        const cy = (e.clientY - rect.top)  * (mc.height / rect.height);
+                        const img = measCanvasToImage(cx, cy);
+                        if (!img) return;
+                        // Probe: show HU at cursor
+                        if (measToolRef.current === 'probe') {
+                            const hu = getHUAt(img.x, img.y);
+                            setProbeHU(hu !== null ? { hu, cx: e.clientX, cy: e.clientY } : null);
+                        }
+                        // Update draft live point
+                        if (measDrawRef.current) {
+                            measDrawRef.current.live = img;
+                            renderMeasRef.current?.();
+                        }
+                    }}
+                    onMouseUp={e => {
+                        const tool = measToolRef.current;
+                        if (!tool || tool === 'probe' || !measDrawRef.current) return;
+                        const mc = measureCanvasRef.current;
+                        if (!mc) return;
+                        const rect = mc.getBoundingClientRect();
+                        const cx = (e.clientX - rect.left) * (mc.width / rect.width);
+                        const cy = (e.clientY - rect.top)  * (mc.height / rect.height);
+                        const img = measCanvasToImage(cx, cy);
+                        if (!img) { measDrawRef.current = null; return; }
+
+                        const element = elementRef.current;
+                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                        const csImg = element ? cornerstone.getImage(element) as any : null;
+                        const colSp = csImg?.columnPixelSpacing ?? 1;
+                        const rowSp = csImg?.rowPixelSpacing ?? 1;
+
+                        const p1 = measDrawRef.current.pts[0];
+                        const newItem: MeasItem = {
+                            id: `${tool}-${Date.now()}`,
+                            type: tool as 'ruler' | 'roi',
+                            sliceIdx: currentIndexRef.current ?? 0,
+                            pts: [p1, img],
+                        };
+
+                        if (tool === 'ruler') {
+                            const dx = (img.x - p1.x) * colSp;
+                            const dy = (img.y - p1.y) * rowSp;
+                            newItem.distMm = Math.sqrt(dx * dx + dy * dy);
+                        }
+                        if (tool === 'roi') {
+                            newItem.stats = computeRoiStats(p1, img) ?? undefined;
+                        }
+
+                        measDrawRef.current = null;
+                        setMeasItems(prev => {
+                            const next = [...prev, newItem];
+                            measItemsRef2.current = next;
+                            props.onMeasItemsChange?.(next);
+                            return next;
+                        });
+                        renderMeasRef.current?.();
+                    }}
+                    onMouseLeave={() => {
+                        setProbeHU(null);
+                        if (measDrawRef.current) {
+                            measDrawRef.current.live = null;
+                            renderMeasRef.current?.();
+                        }
+                    }}
+                />
                 {/* Brush/eraser cursor circle (topmost, updated on every mousemove via RAF) */}
                 <canvas
                     ref={cursorCanvasRef}
@@ -1707,6 +2203,39 @@ const CornerstoneViewer: React.FC<CornerstoneViewerProps> = (props: CornerstoneV
                     <div className="text-slate-600">
                         Scroll / ↑↓ = 슬라이스 &nbsp;|&nbsp; 우클릭 = Pan &nbsp;|&nbsp; 휠클릭 = Zoom
                     </div>
+                </div>
+            )}
+
+            {/* HU Probe tooltip */}
+            {probeHU && measTool === 'probe' && (
+                <div className="absolute z-20 bg-black/80 border border-sky-700 rounded px-2 py-1 text-[11px] font-mono pointer-events-none"
+                    style={{ left: 12, top: 12 }}>
+                    <span className="text-sky-400 font-bold">HU </span>
+                    <span className="text-white">{probeHU.hu.toFixed(0)}</span>
+                </div>
+            )}
+
+            {/* Measurement stats mini-panel */}
+            {measItems.length > 0 && (
+                <div className="absolute bottom-3 left-3 z-10 bg-black/75 border border-[#2d2d50] rounded-lg p-2 text-[10px] font-mono max-w-[220px] space-y-1 select-none pointer-events-none">
+                    <div className="text-slate-400 text-[9px] uppercase tracking-wider mb-0.5">측정 결과</div>
+                    {measItems.slice(-4).map(item => (
+                        <div key={item.id} className="flex items-start gap-1">
+                            <span className={item.type === 'ruler' ? 'text-yellow-400' : 'text-green-400'}>
+                                {item.type === 'ruler' ? '📏' : '▭'}
+                            </span>
+                            <span className="text-slate-300">
+                                {item.type === 'ruler' && item.distMm != null
+                                    ? `${item.distMm.toFixed(1)} mm`
+                                    : item.stats
+                                        ? `${item.stats.mean.toFixed(0)} HU ±${item.stats.std.toFixed(0)}`
+                                        : '—'
+                                }
+                                <span className="text-slate-600 ml-1">S{item.sliceIdx + 1}</span>
+                            </span>
+                        </div>
+                    ))}
+                    {measItems.length > 4 && <div className="text-slate-600">+{measItems.length - 4}개 더...</div>}
                 </div>
             )}
 

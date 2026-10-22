@@ -12,6 +12,20 @@ dist
 dist-ssr
 *.local
 
+# Environment variables (contains API keys — never commit)
+.env
+.env.local
+.env.*.local
+
+# Build artifacts
+MediSeg.WPF/bin/
+MediSeg.WPF/obj/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

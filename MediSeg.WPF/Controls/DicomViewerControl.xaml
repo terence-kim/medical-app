@@ -1,0 +1,84 @@
+<UserControl x:Class="MediSeg.WPF.Controls.DicomViewerControl"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Background="#0d0d1a"
+             ClipToBounds="True">
+    <Grid>
+        <!-- DICOM 이미지 (WriteableBitmap) -->
+        <Image x:Name="DicomImage"
+               Stretch="Uniform"
+               RenderOptions.BitmapScalingMode="NearestNeighbor"
+               SnapsToDevicePixels="True"/>
+
+        <!-- 브러시/마스크 오버레이 Canvas -->
+        <Canvas x:Name="OverlayCanvas"
+                Background="Transparent"
+                Cursor="None"
+                MouseMove="Canvas_MouseMove"
+                MouseDown="Canvas_MouseDown"
+                MouseUp="Canvas_MouseUp"
+                MouseLeave="Canvas_MouseLeave"
+                MouseWheel="Canvas_MouseWheel">
+
+            <!-- 브러시 커서 원 -->
+            <Ellipse x:Name="BrushCursor"
+                     Stroke="#44ffffff"
+                     StrokeThickness="1.5"
+                     Fill="Transparent"
+                     IsHitTestVisible="False"
+                     Visibility="Hidden"/>
+        </Canvas>
+
+        <!-- 슬라이스 정보 HUD (좌상단) -->
+        <StackPanel VerticalAlignment="Top" HorizontalAlignment="Left"
+                    Margin="8,6" IsHitTestVisible="False" Orientation="Horizontal" TextBlock.Foreground="White">
+            <Border Background="#aa16162a" CornerRadius="4" Padding="6,3">
+                <TextBlock x:Name="SliceLabel"
+                           Foreground="#60a5fa" FontSize="11"
+                           FontFamily="Consolas" FontWeight="Bold"
+                           Text="--/--"/>
+            </Border>
+            <Border Background="#aa16162a" CornerRadius="4" Padding="6,3" Margin="4,0,0,0">
+                <TextBlock x:Name="WlLabel"
+                           Foreground="#94a3b8" FontSize="10"
+                           FontFamily="Consolas"
+                           Text="W:-- L:--"/>
+            </Border>
+        </StackPanel>
+
+        <!-- HU 값 표시 (우상단) -->
+        <Border Background="#aa16162a" CornerRadius="4" Padding="6,3"
+                VerticalAlignment="Top" HorizontalAlignment="Right"
+                Margin="0,6,8,0" IsHitTestVisible="False">
+            <TextBlock x:Name="HuLabel"
+                       Foreground="#94a3b8" FontSize="10" FontFamily="Consolas"
+                       Text="HU: --"/>
+        </Border>
+
+        <!-- 로딩 오버레이 -->
+        <Grid x:Name="LoadingOverlay" Visibility="Collapsed">
+            <Rectangle Fill="#cc0d0d1a"/>
+            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                <TextBlock Text="DICOM 로딩 중..." Foreground="#94a3b8"
+                           HorizontalAlignment="Center" FontSize="13"/>
+                <ProgressBar x:Name="LoadBar" Width="200" Height="4"
+                             Minimum="0" Maximum="100"
+                             Foreground="#3b82f6" Background="#1e1e38"/>
+            </StackPanel>
+        </Grid>
+
+        <!-- 빈 상태 안내 -->
+        <StackPanel x:Name="EmptyState"
+                    HorizontalAlignment="Center" VerticalAlignment="Center"
+                    Visibility="Visible">
+            <TextBlock Text="📂" FontSize="40" HorizontalAlignment="Center"
+                       Foreground="#334155"/>
+            <TextBlock Text="DICOM 폴더 또는 파일을 열어주세요"
+                       Foreground="#475569" FontSize="13" Margin="0,8,0,0"
+                       HorizontalAlignment="Center"/>
+            <TextBlock Text="툴바의 'Series' 버튼을 클릭하세요"
+                       Foreground="#334155" FontSize="11" Margin="0,4,0,0"
+                       HorizontalAlignment="Center"/>
+        </StackPanel>
+    </Grid>
+</UserControl>

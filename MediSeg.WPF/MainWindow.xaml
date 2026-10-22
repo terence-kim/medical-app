@@ -1,0 +1,292 @@
+<Window x:Class="MediSeg.WPF.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ctrl="clr-namespace:MediSeg.WPF.Controls"
+        Title="MediSeg — Medical DICOM Viewer"
+        Width="1600" Height="960"
+        MinWidth="1024" MinHeight="600"
+        Background="#0d0d1a"
+        WindowStartupLocation="CenterScreen"
+        KeyDown="Window_KeyDown">
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <!-- 헤더 툴바 -->
+            <RowDefinition Height="44"/>
+            <!-- 메인 컨텐츠 -->
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- ═══════════════════════════════════════════════════════════
+             헤더 툴바 (OHIF 스타일)
+        ═══════════════════════════════════════════════════════════ -->
+        <Border Grid.Row="0"
+                Background="#16162a"
+                BorderBrush="#2d2d50" BorderThickness="0,0,0,1">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>  <!-- 로고 -->
+                    <ColumnDefinition Width="Auto"/>  <!-- 파일 버튼들 -->
+                    <ColumnDefinition Width="Auto"/>  <!-- 구분선 -->
+                    <ColumnDefinition Width="Auto"/>  <!-- 뷰 모드 -->
+                    <ColumnDefinition Width="*"/>     <!-- 환자 정보 -->
+                    <ColumnDefinition Width="Auto"/>  <!-- 우측 버튼 -->
+                </Grid.ColumnDefinitions>
+
+                <!-- 로고 -->
+                <Border Grid.Column="0" Padding="12,0,8,0">
+                    <TextBlock Text="MediSeg"
+                               Foreground="#60a5fa" FontSize="14"
+                               FontWeight="Bold" VerticalAlignment="Center"
+                               FontFamily="Segoe UI"/>
+                </Border>
+
+                <Rectangle Grid.Column="0" Width="1" Fill="#2d2d50"
+                           HorizontalAlignment="Right" Margin="0,8"/>
+
+                <!-- 파일 열기 버튼들 -->
+                <StackPanel Grid.Column="1" Orientation="Horizontal"
+                            VerticalAlignment="Center" Margin="8,0">
+                    <Button x:Name="OpenFolderBtn"
+                            Content="📂 Series (폴더)"
+                            Click="OpenFolder_Click"
+                            Margin="0,0,4,0"
+                            Padding="10,6" FontSize="11"/>
+                    <Button x:Name="OpenFilesBtn"
+                            Content="📄 파일 선택"
+                            Click="OpenFiles_Click"
+                            Padding="10,6" FontSize="11"/>
+                </StackPanel>
+
+                <Rectangle Grid.Column="2" Width="1" Fill="#2d2d50"
+                           Margin="4,8"/>
+
+                <!-- 뷰 모드 선택 -->
+                <StackPanel Grid.Column="3" Orientation="Horizontal"
+                            VerticalAlignment="Center" Margin="8,0">
+                    <RadioButton x:Name="Mode2DBtn"
+                                 Content="2D" IsChecked="True"
+                                 Click="Mode2D_Click"
+                                 Style="{StaticResource {x:Type ToggleButton}}"
+                                 Padding="10,6" FontSize="11" Margin="0,0,2,0"/>
+                    <RadioButton x:Name="ModeMPRBtn"
+                                 Content="MPR"
+                                 Click="ModeMPR_Click"
+                                 Style="{StaticResource {x:Type ToggleButton}}"
+                                 Padding="10,6" FontSize="11" Margin="0,0,2,0"/>
+                    <RadioButton x:Name="ModeQuadBtn"
+                                 Content="Quad"
+                                 Click="ModeQuad_Click"
+                                 Style="{StaticResource {x:Type ToggleButton}}"
+                                 Padding="10,6" FontSize="11"/>
+                </StackPanel>
+
+                <!-- 환자 정보 표시 -->
+                <Border Grid.Column="4" Padding="12,0">
+                    <TextBlock x:Name="PatientInfoLabel"
+                               Foreground="#64748b" FontSize="11"
+                               VerticalAlignment="Center"
+                               Text="DICOM 파일을 열어주세요"
+                               TextTrimming="CharacterEllipsis"/>
+                </Border>
+
+                <!-- 단축키 도움말 -->
+                <Button Grid.Column="5"
+                        Content="⌨ 단축키"
+                        Click="ShowShortcuts_Click"
+                        Padding="10,6" FontSize="11" Margin="0,0,8,0"/>
+            </Grid>
+        </Border>
+
+        <!-- ═══════════════════════════════════════════════════════════
+             메인 컨텐츠 영역
+        ═══════════════════════════════════════════════════════════ -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" MinWidth="300"/>   <!-- 2D 뷰어 -->
+                <ColumnDefinition Width="5"/>                  <!-- 스플리터 -->
+                <ColumnDefinition Width="*" MinWidth="200"/>   <!-- 3D 뷰어 -->
+                <ColumnDefinition Width="Auto"/>               <!-- 마스크 패널 -->
+            </Grid.ColumnDefinitions>
+
+            <!-- ── 2D DICOM 뷰어 (또는 MPR) ────────────────────────── -->
+            <!-- 2D 모드 -->
+            <ctrl:DicomViewerControl x:Name="DicomViewer"
+                                     Grid.Column="0"
+                                     Visibility="Visible"/>
+
+            <!-- MPR 모드 -->
+            <ctrl:MprViewerControl x:Name="MprViewer"
+                                   Grid.Column="0"
+                                   Visibility="Collapsed"/>
+
+            <!-- Quad 모드: 2x2 그리드 -->
+            <Grid x:Name="QuadView" Grid.Column="0" Visibility="Collapsed">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="3"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="3"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+
+                <!-- Axial (좌상) -->
+                <Grid Grid.Row="0" Grid.Column="0">
+                    <ctrl:DicomViewerControl x:Name="QuadAxialViewer"/>
+                    <Border VerticalAlignment="Top" HorizontalAlignment="Left"
+                            Background="#aa1e1e38" Padding="6,2">
+                        <TextBlock Text="AXIAL" Foreground="#60a5fa"
+                                   FontSize="9" FontWeight="Bold"/>
+                    </Border>
+                </Grid>
+
+                <GridSplitter Grid.Row="0" Grid.Column="1"
+                              ResizeDirection="Columns" Background="#2d2d50"/>
+                <GridSplitter Grid.Row="1" Grid.ColumnSpan="3"
+                              ResizeDirection="Rows" Background="#2d2d50"
+                              HorizontalAlignment="Stretch"/>
+
+                <!-- Sagittal (우상) -->
+                <Grid Grid.Row="0" Grid.Column="2" Background="Black">
+                    <Image x:Name="QuadSagittalImage" Stretch="Uniform"
+                           RenderOptions.BitmapScalingMode="HighQuality"/>
+                    <Border VerticalAlignment="Top" HorizontalAlignment="Left"
+                            Background="#aa1e1e38" Padding="6,2">
+                        <TextBlock Text="SAGITTAL" Foreground="#22c55e"
+                                   FontSize="9" FontWeight="Bold"/>
+                    </Border>
+                </Grid>
+
+                <!-- Coronal (좌하) -->
+                <Grid Grid.Row="2" Grid.Column="0" Background="Black">
+                    <Image x:Name="QuadCoronalImage" Stretch="Uniform"
+                           RenderOptions.BitmapScalingMode="HighQuality"/>
+                    <Border VerticalAlignment="Top" HorizontalAlignment="Left"
+                            Background="#aa1e1e38" Padding="6,2">
+                        <TextBlock Text="CORONAL" Foreground="#f97316"
+                                   FontSize="9" FontWeight="Bold"/>
+                    </Border>
+                </Grid>
+
+                <!-- 3D (우하) -->
+                <ctrl:Viewer3DControl x:Name="Quad3DViewer"
+                                      Grid.Row="2" Grid.Column="2"/>
+            </Grid>
+
+            <!-- 스플리터 -->
+            <GridSplitter Grid.Column="1"
+                          ResizeDirection="Columns"
+                          HorizontalAlignment="Stretch"
+                          Background="#2d2d50"
+                          ShowsPreview="True"/>
+
+            <!-- ── 3D 뷰어 ────────────────────────────────────────── -->
+            <ctrl:Viewer3DControl x:Name="Viewer3D"
+                                  Grid.Column="2"/>
+
+            <!-- ── 마스크 패널 ──────────────────────────────────────── -->
+            <Border Grid.Column="3"
+                    BorderBrush="#2d2d50" BorderThickness="1,0,0,0">
+                <ctrl:MaskPanelControl x:Name="MaskPanel"/>
+            </Border>
+        </Grid>
+
+        <!-- ── Toast 알림 ───────────────────────────────────────── -->
+        <Border x:Name="ToastBorder"
+                Grid.Row="1"
+                HorizontalAlignment="Center" VerticalAlignment="Bottom"
+                Margin="0,0,0,20"
+                Background="#1e1e1e" BorderBrush="#444" BorderThickness="1"
+                CornerRadius="8" Padding="16,8"
+                Visibility="Collapsed" MaxWidth="500">
+            <TextBlock x:Name="ToastText"
+                       Foreground="White" FontSize="12"
+                       TextAlignment="Center" TextWrapping="Wrap"/>
+        </Border>
+
+        <!-- ── 단축키 도움말 오버레이 ──────────────────────────── -->
+        <Grid x:Name="ShortcutsOverlay" Grid.RowSpan="2"
+              Visibility="Collapsed"
+              MouseDown="ShortcutsOverlay_MouseDown">
+            <Rectangle Fill="#88000000"/>
+            <Border HorizontalAlignment="Center" VerticalAlignment="Center"
+                    Background="#16162a" BorderBrush="#3a3a60" BorderThickness="1"
+                    CornerRadius="12" Padding="24,20" Width="440">
+                <StackPanel>
+                    <DockPanel Margin="0,0,0,12">
+                        <TextBlock Text="⌨ 단축키" Foreground="White"
+                                   FontWeight="Bold" FontSize="14"/>
+                        <Button DockPanel.Dock="Right" Content="✕"
+                                Click="CloseShortcuts_Click"
+                                Background="Transparent" BorderThickness="0"
+                                Foreground="#94a3b8" FontSize="14" Padding="4"/>
+                    </DockPanel>
+
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="60"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="60"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition/><RowDefinition/><RowDefinition/>
+                            <RowDefinition/><RowDefinition/><RowDefinition/>
+                            <RowDefinition/><RowDefinition/>
+                        </Grid.RowDefinitions>
+
+                        <!-- 단축키 목록 -->
+                        <TextBlock Grid.Row="0" Grid.Column="0" Text="B" Style="{DynamicResource KeyStyle}"/>
+                        <TextBlock Grid.Row="0" Grid.Column="1" Text="그리기 모드" Style="{DynamicResource DescStyle}"/>
+                        <TextBlock Grid.Row="0" Grid.Column="2" Text="E" Style="{DynamicResource KeyStyle}"/>
+                        <TextBlock Grid.Row="0" Grid.Column="3" Text="지우기 모드" Style="{DynamicResource DescStyle}"/>
+
+                        <TextBlock Grid.Row="1" Grid.Column="0" Text="S" Style="{DynamicResource KeyStyle}"/>
+                        <TextBlock Grid.Row="1" Grid.Column="1" Text="Smart Brush 토글" Style="{DynamicResource DescStyle}"/>
+                        <TextBlock Grid.Row="1" Grid.Column="2" Text="H" Style="{DynamicResource KeyStyle}"/>
+                        <TextBlock Grid.Row="1" Grid.Column="3" Text="세그멘테이션 오버레이" Style="{DynamicResource DescStyle}"/>
+
+                        <TextBlock Grid.Row="2" Grid.Column="0" Text="G" Style="{DynamicResource KeyStyle}"/>
+                        <TextBlock Grid.Row="2" Grid.Column="1" Text="3D 생성" Style="{DynamicResource DescStyle}"/>
+                        <TextBlock Grid.Row="2" Grid.Column="2" Text="[ / ]" Style="{DynamicResource KeyStyle}"/>
+                        <TextBlock Grid.Row="2" Grid.Column="3" Text="브러시 크기" Style="{DynamicResource DescStyle}"/>
+
+                        <TextBlock Grid.Row="3" Grid.Column="0" Text="스크롤" Style="{DynamicResource KeyStyle}"/>
+                        <TextBlock Grid.Row="3" Grid.Column="1" Text="슬라이스 이동" Style="{DynamicResource DescStyle}"/>
+                        <TextBlock Grid.Row="3" Grid.Column="2" Text="Ctrl+스크롤" Style="{DynamicResource KeyStyle}"/>
+                        <TextBlock Grid.Row="3" Grid.Column="3" Text="줌 인/아웃" Style="{DynamicResource DescStyle}"/>
+
+                        <TextBlock Grid.Row="4" Grid.Column="0" Text="우클릭+끌기" Style="{DynamicResource KeyStyle}"/>
+                        <TextBlock Grid.Row="4" Grid.Column="1" Text="Window/Level" Style="{DynamicResource DescStyle}"/>
+                        <TextBlock Grid.Row="4" Grid.Column="2" Text="중간버튼" Style="{DynamicResource KeyStyle}"/>
+                        <TextBlock Grid.Row="4" Grid.Column="3" Text="팬" Style="{DynamicResource DescStyle}"/>
+
+                        <TextBlock Grid.Row="5" Grid.Column="0" Text="1 ~ 8" Style="{DynamicResource KeyStyle}"/>
+                        <TextBlock Grid.Row="5" Grid.Column="1" Text="마스크 표시/숨기기" Style="{DynamicResource DescStyle}"/>
+                        <TextBlock Grid.Row="5" Grid.Column="2" Text="?" Style="{DynamicResource KeyStyle}"/>
+                        <TextBlock Grid.Row="5" Grid.Column="3" Text="이 도움말" Style="{DynamicResource DescStyle}"/>
+                    </Grid>
+                </StackPanel>
+            </Border>
+        </Grid>
+    </Grid>
+
+    <Window.Resources>
+        <Style x:Key="KeyStyle" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#64748b"/>
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="FontFamily" Value="Consolas"/>
+            <Setter Property="Margin" Value="0,3"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+        <Style x:Key="DescStyle" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#cbd5e1"/>
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="Margin" Value="0,3,0,3"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+    </Window.Resources>
+</Window>
