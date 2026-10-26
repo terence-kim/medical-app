@@ -7,6 +7,11 @@ import MaskPanel from './components/MaskPanel'
 import FindingsPanel from './components/FindingsPanel'
 import { DEFAULT_MASKS, type Mask } from './types/mask'
 import { useMPRVolume } from './hooks/useMPRVolume'
+import {
+  downloadSegmentation,
+  openSegmentationFile,
+  base64ToUint8,
+} from './utils/segmentationIO'
 import './App.css'
 
 function App() {
@@ -55,6 +60,15 @@ function App() {
   // Tracks the current axial slice index for crosshair linking in quad mode
   const [axialSliceIdx, setAxialSliceIdx] = useState(0);
 
+  // ── AI 상태 ──────────────────────────────────────────────────────────────
+  const [aiAvailable, setAiAvailable] = useState(false);
+  useEffect(() => {
+    fetch('http://localhost:8765/ai-status')
+      .then(r => r.json())
+      .then(d => setAiAvailable(d.available === true))
+      .catch(() => setAiAvailable(false));
+  }, []);
+
   // ── VTK / 3D ──────────────────────────────────────────────────────────────
   const vtkGenerateRef      = useRef<(() => void) | null>(null);
   // refreshLabelMapRef: VTKViewer populates this; CornerstoneViewer calls it to push
@@ -63,18 +77,77 @@ function App() {
     const vtkRefreshSliceRef    = useRef<((info: {
         sliceIdx: number; pixelData: Uint8Array; width: number; height: number; numSlices: number;
     }) => void) | null>(null);
-  const csViewerRef           = useRef<{
-    fillCurrentSlice:          () => void;
-    fillAllSlices:             () => void;
-    sendTo3D:                  () => void;
-    applyOrgansSegmentation:   (organs: { id: string; huMin: number; huMax: number }[]) => Promise<void>;
-    apply3DLabelMap:           (info: {
-        data: Uint8Array;
-        volW: number; volH: number; volD: number;
-        xyScale: number; zStep: number;
-        previous?: Uint8Array;
-    }) => void;
-  } | null>(null);
+
+  // ── 세그멘테이션 저장/불러오기 ──────────────────────────────────────────
+  const vtkSaveSegRef    = useRef<(() => { labelmap: Uint8Array; dims: { volW: number; volH: number; volD: number; xyScale: number; zStep: number } } | null) | null>(null);
+  const vtkLoadSegRef    = useRef<((labelmap: Uint8Array, dims: { volW: number; volH: number; volD: number; xyScale: number; zStep: number }) => void) | null>(null);
+  const vtkHUSegRef      = useRef<(() => Promise<void>) | null>(null);
+  const vtkAISegRef      = useRef<(() => Promise<void>) | null>(null);
+  const vtkMeshOnlyRef   = useRef<(() => Promise<void>) | null>(null);
+
+  const handleSaveSeg = useCallback(async () => {
+    const data = vtkSaveSegRef.current?.();
+    if (!data) {
+      showToast('저장할 세그멘테이션 데이터가 없습니다. 먼저 HU 분할 또는 AI 분할을 실행해주세요.');
+      return;
+    }
+    try {
+      downloadSegmentation(data.labelmap, data.dims, masks);
+      showToast('세그멘테이션이 .medseg 파일로 저장되었습니다.');
+    } catch (e) {
+      showToast('저장 실패: ' + String(e));
+    }
+  }, [masks]);
+
+  const handleLoadSeg = useCallback(async () => {
+    try {
+      const seg = await openSegmentationFile();
+      const labelmap = base64ToUint8(seg.data);
+      if (vtkLoadSegRef.current) {
+        vtkLoadSegRef.current(labelmap, seg.dims);
+        showToast(`세그멘테이션 불러오기 완료 (${new Date(seg.createdAt).toLocaleString()})`);
+      } else {
+        showToast('먼저 DICOM 파일을 불러오세요.');
+      }
+    } catch (e) {
+      if (String(e).includes('취소')) return;
+      showToast('불러오기 실패: ' + String(e));
+    }
+  }, []);
+
+  const handleAISegment = useCallback(async () => {
+    if (!selectedFiles || selectedFiles.length === 0) {
+      showToast('먼저 DICOM 파일을 불러오세요.');
+      return;
+    }
+    if (!aiAvailable) {
+      showToast('TotalSegmentator가 설치되어 있지 않습니다.\n터미널에서: pip install TotalSegmentator');
+      return;
+    }
+    setIsGenerating(true);
+    showToast('AI 분할 중… (CPU ~5분 소요, GPU는 더 빠름)');
+    try {
+      const formData = new FormData();
+      selectedFiles.forEach(f => formData.append('files', f));
+      const res = await fetch('http://localhost:8765/segment/ai', {
+        method: 'POST',
+        body: formData,
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail?.error ?? JSON.stringify(err.detail));
+      }
+      const json = await res.json();
+      showToast(`AI 분할 완료 (${json.duration_s?.toFixed(1)}s) — 3D 메쉬 생성 중…`);
+      // AI 분할 후 3D 메쉬 생성
+      await vtkMeshOnlyRef.current?.();
+    } catch (e) {
+      showToast('AI 분할 오류: ' + String(e));
+    } finally {
+      setIsGenerating(false);
+    }
+  }, [selectedFiles, aiAvailable]);
+  const csViewerRef = useRef<import('./components/CornerstoneViewer').CornerstoneViewerHandle | null>(null);
 
   // Sync active mask HU range to brush when mask changes
   const handleActiveMaskChange = useCallback((id: string) => {
@@ -325,6 +398,11 @@ function App() {
                     on3DLabelMapEdited={(info) => {
                       csViewerRef.current?.apply3DLabelMap(info);
                     }}
+                    saveSegRef={vtkSaveSegRef}
+                    loadSegRef={vtkLoadSegRef}
+                    huSegmentOnlyRef={vtkHUSegRef}
+                    aiSegmentRef={vtkAISegRef}
+                    meshOnlyRef={vtkMeshOnlyRef}
                   />
                 ) : (
                   <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 pointer-events-none">
@@ -441,6 +519,11 @@ function App() {
                   on3DLabelMapEdited={(info) => {
                     csViewerRef.current?.apply3DLabelMap(info);
                   }}
+                  saveSegRef={vtkSaveSegRef}
+                  loadSegRef={vtkLoadSegRef}
+                  huSegmentOnlyRef={vtkHUSegRef}
+                  aiSegmentRef={vtkAISegRef}
+                  meshOnlyRef={vtkMeshOnlyRef}
                 />
               ) : (
                 <div className="absolute inset-0 flex items-center justify-center text-slate-700 text-xs">
@@ -499,6 +582,12 @@ function App() {
           onBrushHuChange={handleBrushHuChange}
           onGatePreviewChange={setGatePreviewActive}
           onGenerateModel={() => vtkGenerateRef.current?.()}
+          onHUSegment={() => vtkHUSegRef.current?.()}
+          onAISegment={handleAISegment}
+          onMeshOnly={() => vtkMeshOnlyRef.current?.()}
+          aiAvailable={aiAvailable}
+          onSaveSeg={handleSaveSeg}
+          onLoadSeg={handleLoadSeg}
           onFillCurrentSlice={() => csViewerRef.current?.fillCurrentSlice()}
           onFillAllSlices={() => csViewerRef.current?.fillAllSlices()}
           onSendTo3D={() => csViewerRef.current?.sendTo3D()}

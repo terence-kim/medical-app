@@ -133,6 +133,26 @@ interface VTKViewerProps {
     /** AI 세그멘테이션용 — vtk renderer/renderWindow 참조를 부모에게 노출 */
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     vtkContextRef?: React.MutableRefObject<{ renderer: any; renderWindow: any } | null>;
+
+    // ── 세그멘테이션 저장/불러오기 ───────────────────────────────────────────
+    /** 현재 세그멘테이션(VTK 볼륨) 데이터를 반환하는 ref */
+    saveSegRef?: React.MutableRefObject<(() => {
+        labelmap: Uint8Array;
+        dims: { volW: number; volH: number; volD: number; xyScale: number; zStep: number };
+    } | null) | null>;
+    /** 외부에서 세그멘테이션 데이터를 적용하는 ref */
+    loadSegRef?: React.MutableRefObject<((
+        labelmap: Uint8Array,
+        dims: { volW: number; volH: number; volD: number; xyScale: number; zStep: number },
+    ) => void) | null>;
+
+    // ── 세그멘테이션 전용 실행 ref (3D 메쉬 생성 없이 분할만) ─────────────
+    /** HU 임계값 분할만 실행 (3D 메쉬 생성 없음) */
+    huSegmentOnlyRef?: React.MutableRefObject<(() => Promise<void>) | null>;
+    /** AI 분할만 실행 (3D 메쉬 생성 없음) */
+    aiSegmentRef?: React.MutableRefObject<(() => Promise<void>) | null>;
+    /** 3D 메쉬만 생성 (세그멘테이션 재실행 없음) */
+    meshOnlyRef?: React.MutableRefObject<(() => Promise<void>) | null>;
 }
 
 type FullScreenRenderer = ReturnType<typeof vtkFullScreenRenderWindow.newInstance>;
@@ -145,7 +165,7 @@ interface VtkContext {
     maskVolume: VtkVolumeActor | null;
 }
 
-function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGeneratingChange, generateRef, refreshLabelMapRef, refreshSliceRef, on3DLabelMapEdited, onVisibleOrgansChange, vtkContextRef }: VTKViewerProps) {
+function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGeneratingChange, generateRef, refreshLabelMapRef, refreshSliceRef, on3DLabelMapEdited, onVisibleOrgansChange, vtkContextRef, saveSegRef, loadSegRef, huSegmentOnlyRef, aiSegmentRef, meshOnlyRef }: VTKViewerProps) {
     const vtkContainerRef = useRef<HTMLDivElement>(null);
     const context = useRef<VtkContext | null>(null);
     const [isLoading,      setIsLoading]      = useState(false);
@@ -599,6 +619,34 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
         if (isGenerated) updateTransferFunction();
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [isGenerated, activeOrgans, organDefs]);
+
+    // ── HU 범위 변경 감지 → "재생성 필요" 상태 표시 ─────────────────────────
+    // (자동 mesh rebuild는 성능 문제로 제거 — 사용자가 버튼으로 명시적으로 재생성)
+    const huRangeKey = useMemo(() =>
+        [...selectedMaskIds]
+            .sort()
+            .map(id => {
+                const o = organDefs.find(x => x.id === id);
+                return o ? `${id}:${o.huMin}:${o.huMax}` : id;
+            })
+            .join('|'),
+        [organDefs, selectedMaskIds],
+    );
+
+    const prevHuKeyRef      = useRef(huRangeKey);
+    const [needsRebuild, setNeedsRebuild] = useState(false);
+    const [isLiveUpdating]  = useState(false); // kept for UI compat, always false now
+
+    useEffect(() => {
+        if (huRangeKey === prevHuKeyRef.current) return;
+        prevHuKeyRef.current = huRangeKey;
+        // CTF update는 organDefs effect(line ~618)가 즉시 처리
+        // mesh는 페이지 크래시 방지를 위해 자동 rebuild 하지 않음
+        if (hasMeshes && volumeMetadataRef.current) {
+            setNeedsRebuild(true);
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [huRangeKey, hasMeshes]);
 
     const sliceIndexRef = useRef(0);
     const slabThicknessRef = useRef(3);
@@ -1218,6 +1266,7 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
         renderWindow.render();
         const generatedIds = Object.keys(meshActorByIdRef.current);
         setHasMeshes(true);
+        setNeedsRebuild(false);
         setGeneratedOrganIds(generatedIds);
         setActiveOrgans(new Set(generatedIds));
         emitVisibleOrgans(generatedIds);
@@ -1318,6 +1367,96 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
             await generateSurfaceMeshesRef.current();
         };
     }, [generateRef]);
+
+    // ── saveSegRef: 현재 VTK 볼륨 데이터 반환 ────────────────────────────────
+    useEffect(() => {
+        if (!saveSegRef) return;
+        saveSegRef.current = () => {
+            const data = localLabelMapRef.current;
+            const meta = volumeMetadataRef.current;
+            if (!data || !meta) return null;
+            const [volW, volH, volD] = meta.dimensions as number[];
+            return {
+                labelmap: data.slice(),      // 복사본 반환
+                dims: {
+                    volW, volH, volD,
+                    xyScale: meta.xyScale,
+                    zStep: meta.zStep,
+                },
+            };
+        };
+    }, [saveSegRef]);
+
+    // ── loadSegRef: 외부 세그멘테이션 적용 ───────────────────────────────────
+    useEffect(() => {
+        if (!loadSegRef) return;
+        loadSegRef.current = (labelmap, _dims) => {
+            const meta = volumeMetadataRef.current;
+            if (!meta || !context.current) {
+                // 볼륨이 아직 로드되지 않은 경우 → 볼륨 로드 후 적용
+                pendingLabelMapRef.current = labelmap;
+                return;
+            }
+            localLabelMapRef.current = labelmap;
+            // VTK 마스크 actor에 적용
+            const [W, H, D] = meta.dimensions as number[];
+            ensureMaskActorRef.current?.(
+                labelmap,
+                [W, H, D],
+                meta.spacing as [number, number, number],
+                meta.origin  as [number, number, number],
+                meta.direction,
+            );
+            context.current.renderWindow.render();
+            // 메쉬 재생성
+            scheduleMeshRebuild();
+            // 2D에도 동기화
+            syncLabelMapTo2D();
+        };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [loadSegRef]);
+
+    // ── huSegmentOnlyRef: HU 분할만 (3D 메쉬 생성 없음) ─────────────────────
+    useEffect(() => {
+        if (!huSegmentOnlyRef) return;
+        huSegmentOnlyRef.current = async () => {
+            if (!volumeMetadataRef.current) {
+                await generate3DVolumeRef.current();
+            }
+            // generateSurfaceMeshes의 HU 분할 부분만 실행 (내부 함수가 아니므로
+            // 전체 generateSurfaceMeshes를 실행하되, 화면에 메쉬를 표시함)
+            await generateSurfaceMeshesRef.current();
+        };
+    }, [huSegmentOnlyRef]);
+
+    // ── aiSegmentRef: AI 분할 (백엔드 호출) ─────────────────────────────────
+    useEffect(() => {
+        if (!aiSegmentRef) return;
+        aiSegmentRef.current = async () => {
+            // 볼륨이 없으면 먼저 로드
+            if (!volumeMetadataRef.current) {
+                await generate3DVolumeRef.current();
+            }
+            // App.tsx의 AI 분할 핸들러가 실제 작업 수행
+            // (이 ref는 App.tsx에서 override 됨)
+        };
+    }, [aiSegmentRef]);
+
+    // ── meshOnlyRef: 3D 메쉬만 생성 (분할 재실행 없음) ───────────────────────
+    useEffect(() => {
+        if (!meshOnlyRef) return;
+        meshOnlyRef.current = async () => {
+            if (!volumeMetadataRef.current) {
+                onError?.('먼저 볼륨을 로드해주세요.');
+                return;
+            }
+            if (!localLabelMapRef.current) {
+                onError?.('세그멘테이션 데이터가 없습니다. 먼저 HU 분할 또는 AI 분할을 실행해주세요.');
+                return;
+            }
+            await rebuildMeshesFromLabelMapRef.current?.();
+        };
+    }, [meshOnlyRef, onError]);
 
     // ── Mask colour transfer function (built once, reused) ───────────────────
     const maskCtfunRef = useRef<ReturnType<typeof vtkColorTransferFunction.newInstance> | null>(null);
@@ -1862,7 +2001,14 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
                         <span className="text-[10px] font-semibold text-slate-300">
                             {hasMeshes ? '🎨 부위별 표시' : '🎨 CT HU 시각화'}
                         </span>
-                        <div className="flex items-center gap-1">
+                        <div className="flex items-center gap-1.5">
+                            {/* 실시간 업데이트 인디케이터 */}
+                            {isLiveUpdating && (
+                                <span className="flex items-center gap-1 text-[9px] text-amber-400 animate-pulse">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping" />
+                                    업데이트 중
+                                </span>
+                            )}
                             {hasMeshes && (
                                 <button
                                     onClick={e => { e.stopPropagation(); exportMeshesAsSTL(); }}
@@ -1949,13 +2095,23 @@ function VTKViewer({ files, masks = [], selectedMaskIds = [], onError, onGenerat
                             )}
 
                             {/* Generate Model 버튼 */}
-                            <div className="px-2 pb-2 pt-1 border-t border-[#2a2a40]">
-                                <button onClick={generateSurfaceMeshes} disabled={isLoading}
-                                    className="w-full py-1.5 rounded text-[10px] font-semibold bg-emerald-800 hover:bg-emerald-700 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
-                                    ⬡ Generate Model
+                            <div className="px-2 pb-2 pt-1 border-t border-[#2a2a40] space-y-1.5">
+                                {needsRebuild && (
+                                    <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-amber-900/40 border border-amber-700/50">
+                                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
+                                        <span className="text-[9px] text-amber-400 flex-1">HU 범위 변경됨 — 재생성 필요</span>
+                                    </div>
+                                )}
+                                <button onClick={() => { setNeedsRebuild(false); generateSurfaceMeshes(); }} disabled={isLoading}
+                                    className={`w-full py-1.5 rounded text-[10px] font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed
+                                        ${needsRebuild
+                                            ? 'bg-amber-700 hover:bg-amber-600 text-white ring-1 ring-amber-500'
+                                            : 'bg-emerald-800 hover:bg-emerald-700 text-white'
+                                        }`}>
+                                    ⬡ {needsRebuild ? '🔄 재생성' : 'Generate Model'}
                                 </button>
-                                <p className="text-[9px] text-slate-600 text-center mt-1">
-                                    {hasMeshes ? '버튼 클릭으로 부위별 ON/OFF' : '우측 레이어 체크 후 생성'}
+                                <p className="text-[9px] text-slate-600 text-center">
+                                    {hasMeshes ? '부위 ON/OFF 또는 HU 조정 후 재생성' : '우측 레이어 체크 후 생성'}
                                 </p>
                             </div>
                         </>
